@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use crate::{
     asset_object::AssetObject,
     helper::{Helper, HelperError},
-    library::{self, Album, Asset, Library},
+    edit::Recipe,
+    library::{self, Album, Asset, EDITED_PREVIEW, EDITED_THUMB, Library, ORIGINAL, PREVIEW, THUMB},
+    render,
     store::{self, Download, Store},
 };
 
@@ -35,6 +37,8 @@ pub enum Event {
     /// Listing the library (items seen so far), or done.
     Scanning(Option<usize>),
     Albums,
+    /// An item's edit changed (asset id).
+    Edited(String),
     /// Downloading into the library: (files done, files total, bytes done), or idle.
     Syncing(Option<(usize, usize, u64)>),
     Toast(String),
@@ -78,7 +82,7 @@ fn state_dir() -> std::path::PathBuf {
     dir
 }
 
-fn temp_dir() -> std::path::PathBuf {
+pub fn temp_dir() -> std::path::PathBuf {
     std::env::var_os("CLOUDPHOTOS_CACHE_DIR")
         .map(Into::into)
         .unwrap_or_else(|| glib::user_cache_dir().join("cloudphotos"))
@@ -393,8 +397,20 @@ impl Model {
 
     // ── files ───────────────────────────────────────────────────────────────
 
+    /// What to show for `kind`: the edited rendering when the photo has an edit.
+    pub fn display_kind(object: &AssetObject, kind: &str) -> &'static str {
+        let edited = object.with(|a| a.edit.is_some());
+        match (kind, edited) {
+            (THUMB, true) => EDITED_THUMB,
+            (PREVIEW, true) => EDITED_PREVIEW,
+            (THUMB, false) => THUMB,
+            _ => PREVIEW,
+        }
+    }
+
     /// A thumbnail or preview; waits for the sync if it isn't downloaded yet.
     pub async fn texture(self: &Rc<Self>, object: &AssetObject, kind: &str) -> Option<gdk::Texture> {
+        let kind = Self::display_kind(object, kind);
         let id = object.id();
         match self.store.texture(&id, kind).await {
             Ok(texture) => Some(texture),
@@ -423,6 +439,65 @@ impl Model {
     /// Whether the original is in the library yet.
     pub async fn has_original(self: &Rc<Self>, object: &AssetObject) -> bool {
         self.store.has(&object.id(), crate::library::ORIGINAL).await
+    }
+
+    // ── editing ─────────────────────────────────────────────────────────────
+
+    /// Save a local edit (an identity recipe reverts). Renders the edited
+    /// thumbnail and preview from the full-resolution original.
+    pub async fn save_edit(self: &Rc<Self>, object: &AssetObject, recipe: Recipe) -> Result<(), String> {
+        let id = object.id();
+        if recipe.is_identity() {
+            self.library.borrow().remove_edit(&id);
+            self.edited(object, None);
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        render::store_display_images(&self.store, &temp_dir(), &self.library_path(), &id, recipe).await?;
+        eprintln!("cloudphotos: rendered edit for {id} in {:?}", started.elapsed());
+        let base = object.with(|a| a.resources.get(ORIGINAL).and_then(|r| r.checksum.clone()));
+        self.library.borrow().set_edit(&id, &recipe, base.as_deref());
+        self.edited(object, Some(recipe));
+        Ok(())
+    }
+
+    /// Refresh everything showing this item after its edit changed.
+    fn edited(&self, object: &AssetObject, recipe: Option<Recipe>) {
+        let id = object.id();
+        self.store.forget(&id);
+        object.update(|a| a.edit = recipe);
+        for kind in [EDITED_THUMB, EDITED_PREVIEW] {
+            self.store.saved(&id, kind);
+        }
+        // Grid cells watch this and reload their thumbnail.
+        object.set_revision(object.revision() + 1);
+        self.notify(Event::Edited(id));
+    }
+
+    /// The edited photo at full resolution as a JPEG, written to `target`.
+    pub async fn render_edited(self: &Rc<Self>, object: &AssetObject, target: std::path::PathBuf) -> Result<std::path::PathBuf, String> {
+        let recipe = object.with(|a| a.edit).unwrap_or_default();
+        render::render_full(&self.store, &temp_dir(), &self.library_path(), &object.id(), recipe, target).await
+    }
+
+    /// Upload the edited photo to iCloud as a new photo next to the original.
+    pub async fn save_copy_to_icloud(self: &Rc<Self>, object: &AssetObject) -> Result<(), String> {
+        let helper = self.helper.borrow().clone().ok_or("Not connected to iCloud.")?;
+        let stem = object.with(|a| std::path::Path::new(&a.filename).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+        let dir = temp_dir().join("upload");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = self.render_edited(object, dir.join(format!("{stem} (Edited).JPG"))).await?;
+        let result = helper.call("upload", json!({"path": path})).await;
+        let _ = std::fs::remove_file(&path);
+        let value = result.map_err(|e| e.message)?;
+        if let Some(asset) = value.get("asset").and_then(|a| serde_json::from_value::<Asset>(a.clone()).ok()) {
+            if self.library.borrow().add_asset(&asset).is_ok() {
+                self.reload();
+                let this = self.clone();
+                glib::spawn_future_local(async move { this.sync().await });
+            }
+        }
+        Ok(())
     }
 
     // ── changes ─────────────────────────────────────────────────────────────

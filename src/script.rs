@@ -41,6 +41,17 @@ pub fn run(window: adw::ApplicationWindow) {
                         button.emit_clicked();
                     }
                 }
+                "render" => {
+                    // render N PATH: item N's edit at full resolution (tests export).
+                    let (n, path) = arg.split_once(' ').unwrap_or((arg, "/tmp/cloudphotos-render.jpg"));
+                    let model = crate::model::model();
+                    if let Some(object) = model.all.item(n.parse().unwrap_or(0)).and_downcast::<crate::asset_object::AssetObject>() {
+                        match model.render_edited(&object, path.into()).await {
+                            Ok(p) => eprintln!("CLOUDPHOTOS_SCRIPT: rendered {}", p.display()),
+                            Err(e) => eprintln!("CLOUDPHOTOS_SCRIPT: render failed: {e}"),
+                        }
+                    }
+                }
                 "quit" => {
                     if let Some(app) = window.application() {
                         app.quit();
@@ -110,7 +121,7 @@ fn find_button(root: &gtk::Widget, tooltip: &str) -> Option<gtk::Button> {
     let mut found = None;
     walk(root, &mut |w| {
         if let Some(button) = w.downcast_ref::<gtk::Button>() {
-            if button.is_mapped() && button.tooltip_text().as_deref() == Some(tooltip) {
+            if button.is_mapped() && (button.tooltip_text().as_deref() == Some(tooltip) || button.label().as_deref() == Some(tooltip)) {
                 found = Some(button.clone());
                 return true;
             }

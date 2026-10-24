@@ -19,6 +19,7 @@ Methods:
   urls     {ids: [...]}                        -> {id: {key: url}} with fresh download URLs
   favorite {id, value}                         -> {}
   delete   {id}                                -> {}   (moves to Recently Deleted)
+  upload   {path}                              -> {asset}  (a new photo, e.g. an edited copy)
 
 `--fake DIR` serves DIR/library.json instead, for tests and screenshots.
 """
@@ -312,6 +313,13 @@ class ICloudLibrary:
         self.assets.pop(params["id"], None)
         return {}
 
+    def upload(self, params):
+        asset = self._photos().upload(params["path"])
+        if asset is None:
+            raise HelperError("failed", "iCloud didn't accept the upload.")
+        self.assets[asset.id] = asset
+        return {"asset": asset_dict(asset)}
+
 
 # ── fake library (tests) ────────────────────────────────────────────────────
 
@@ -370,11 +378,24 @@ class FakeLibrary:
         self._record("delete", params)
         return {}
 
+    def upload(self, params):
+        self._record("upload", params)
+        path = params["path"]
+        url = "file://" + path
+        size = os.path.getsize(path)
+        res = {"url": url, "size": size, "width": 1, "height": 1, "type": "public.jpeg", "checksum": f"up-{size}"}
+        return {"asset": {
+            "id": f"UPLOAD-{int(time.time() * 1000)}", "master": None, "filename": os.path.basename(path),
+            "kind": "photo", "taken": time.time(), "added": time.time(), "width": 1, "height": 1, "size": size,
+            "live": False, "favorite": False, "details": {},
+            "resources": {"thumb": dict(res), "preview": dict(res), "original": dict(res)},
+        }}
+
 
 def main():
     fake = sys.argv[sys.argv.index("--fake") + 1] if "--fake" in sys.argv else None
     library = FakeLibrary(fake) if fake else ICloudLibrary()
-    methods = {name: getattr(library, name) for name in ("connect", "scan", "changed", "urls", "favorite", "delete")}
+    methods = {name: getattr(library, name) for name in ("connect", "scan", "changed", "urls", "favorite", "delete", "upload")}
     for line in sys.stdin:
         try:
             request = json.loads(line)

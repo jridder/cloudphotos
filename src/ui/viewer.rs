@@ -10,7 +10,8 @@ use crate::{
     library::{LIVE, ORIGINAL, PREVIEW, THUMB},
     model::model,
     store,
-    ui::{grid::format_date, info},
+    model::Event,
+    ui::{editor, grid::format_date, info},
 };
 
 struct Viewer {
@@ -32,6 +33,8 @@ struct Viewer {
     next: gtk::Button,
     favorite_handler: RefCell<Option<glib::SignalHandlerId>>,
     loading: Cell<u64>,
+    edit_button: gtk::Button,
+    actions: gio::SimpleActionGroup,
     /// The Live Photo clip already loaded for the current item, replayed on
     /// later clicks rather than fetched again.
     live_media: RefCell<Option<(String, gtk::MediaFile)>>,
@@ -48,13 +51,20 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
         b.set_icon_name(if b.is_active() { "cloudphotos-heart-filled-symbolic" } else { "cloudphotos-heart-symbolic" });
     });
     let info_button = gtk::ToggleButton::builder().icon_name("dialog-information-symbolic").tooltip_text("Info").build();
-    let export = gtk::Button::builder().icon_name("document-save-symbolic").tooltip_text("Export Original…").build();
+    let export = gtk::Button::builder().icon_name("document-save-symbolic").tooltip_text("Export…").build();
+    let edit = gtk::Button::builder().icon_name("document-edit-symbolic").tooltip_text("Edit").build();
+    let more_menu = gio::Menu::new();
+    more_menu.append(Some("Save Copy to iCloud"), Some("viewer.save-copy"));
+    more_menu.append(Some("Revert to Original"), Some("viewer.revert"));
+    let more = gtk::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("More").menu_model(&more_menu).build();
     let delete = gtk::Button::builder().icon_name("user-trash-symbolic").tooltip_text("Delete").build();
     let live = gtk::Button::builder().label("LIVE").tooltip_text("Play Live Photo").visible(false).build();
     live.add_css_class("live-button");
+    header.pack_end(&more);
     header.pack_end(&delete);
     header.pack_end(&info_button);
     header.pack_end(&export);
+    header.pack_end(&edit);
     header.pack_end(&favorite);
     header.pack_start(&live);
 
@@ -122,6 +132,8 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
         next,
         favorite_handler: RefCell::default(),
         loading: Cell::new(0),
+        edit_button: edit.clone(),
+        actions: gio::SimpleActionGroup::new(),
         live_media: RefCell::default(),
         live_pending: Cell::new(false),
     });
@@ -136,6 +148,27 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
     viewer.live.connect_clicked(move |_| v.play_live());
     let v = viewer.clone();
     export.connect_clicked(move |_| v.export());
+    let v = viewer.clone();
+    edit.connect_clicked(move |_| {
+        let (Some(object), Some(nav)) = (v.object.borrow().clone(), v.page.parent().and_downcast::<adw::NavigationView>()) else { return };
+        editor::open(&nav, &v.toasts, &object);
+    });
+    for (name, handler) in [("save-copy", Viewer::save_copy as fn(&Rc<Viewer>)), ("revert", Viewer::revert)] {
+        let action = gio::SimpleAction::new(name, None);
+        let v = viewer.clone();
+        action.connect_activate(move |_, _| handler(&v));
+        viewer.actions.add_action(&action);
+    }
+    page.insert_action_group("viewer", Some(&viewer.actions));
+    // Show a newly saved edit straight away.
+    let weak = Rc::downgrade(&viewer);
+    model().subscribe(move |event| {
+        if let (Event::Edited(id), Some(v)) = (event, weak.upgrade()) {
+            if v.object.borrow().as_ref().is_some_and(|o| o.id() == *id) {
+                v.show(v.position.get());
+            }
+        }
+    });
     let v = viewer.clone();
     delete.connect_clicked(move |_| v.confirm_delete());
 
@@ -245,6 +278,12 @@ impl Viewer {
         self.title.set_subtitle(&format_date(asset.taken));
         self.page.set_title(&asset.filename);
         self.live.set_visible(asset.live && asset.resources.contains_key(LIVE));
+        self.edit_button.set_visible(!asset.is_video());
+        for name in ["save-copy", "revert"] {
+            if let Some(action) = self.actions.lookup_action(name).and_downcast::<gio::SimpleAction>() {
+                action.set_enabled(asset.edit.is_some());
+            }
+        }
         self.fill_info(&object);
         self.set_zoom(0.0);
         self.video.set_media_stream(None::<&gtk::MediaStream>);
@@ -370,9 +409,36 @@ impl Viewer {
 
     fn export(self: &Rc<Self>) {
         let Some(object) = self.object.borrow().clone() else { return };
+        if object.with(|a| a.edit.is_none()) {
+            return self.export_as(object, false);
+        }
+        let dialog = adw::AlertDialog::builder()
+            .heading("Export Which Version?")
+            .body("The edited photo is saved as a full-resolution JPEG with the original's date, camera and location.")
+            .build();
+        dialog.add_responses(&[("cancel", "Cancel"), ("original", "Original"), ("edited", "Edited")]);
+        dialog.set_response_appearance("edited", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("edited"));
+        let this = self.clone();
+        dialog.connect_response(None, move |_, response| match response {
+            "edited" => this.export_as(object.clone(), true),
+            "original" => this.export_as(object.clone(), false),
+            _ => {}
+        });
+        dialog.present(Some(&self.page));
+    }
+
+    fn export_as(self: &Rc<Self>, object: AssetObject, edited: bool) {
+        let filename = object.with(|a| a.filename.clone());
+        let name = if edited {
+            let stem = std::path::Path::new(&filename).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            format!("{stem} (Edited).jpg")
+        } else {
+            filename
+        };
         let dialog = gtk::FileDialog::builder()
-            .title("Export Original")
-            .initial_name(object.with(|a| a.filename.clone()))
+            .title(if edited { "Export Edited Photo" } else { "Export Original" })
+            .initial_name(name)
             .accept_label("Export")
             .build();
         let root = self.page.root().and_downcast::<gtk::Window>();
@@ -381,6 +447,14 @@ impl Viewer {
             let Ok(file) = result else { return };
             let Some(path) = file.path() else { return };
             glib::spawn_future_local(async move {
+                if edited {
+                    this.toast("Exporting…");
+                    match model().render_edited(&object, path).await {
+                        Ok(_) => this.toast("Exported."),
+                        Err(e) => this.toast(&format!("Export failed: {e}")),
+                    }
+                    return;
+                }
                 match model().store.copy_out(&object.id(), ORIGINAL, path).await {
                     Ok(_) => this.toast("Exported."),
                     Err(store::Error::Missing) => {
@@ -389,6 +463,29 @@ impl Viewer {
                     Err(e) => this.toast(&format!("Export failed: {e:?}")),
                 }
             });
+        });
+    }
+
+    fn save_copy(self: &Rc<Self>) {
+        let Some(object) = self.object.borrow().clone() else { return };
+        let this = self.clone();
+        self.toast("Saving a copy to iCloud…");
+        glib::spawn_future_local(async move {
+            match model().save_copy_to_icloud(&object).await {
+                Ok(()) => this.toast("Saved to iCloud as a new photo."),
+                Err(e) => this.toast(&format!("Couldn't save to iCloud: {e}")),
+            }
+        });
+    }
+
+    fn revert(self: &Rc<Self>) {
+        let Some(object) = self.object.borrow().clone() else { return };
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            match model().save_edit(&object, crate::edit::Recipe::default()).await {
+                Ok(()) => this.toast("Reverted to the original."),
+                Err(e) => this.toast(&format!("Couldn't revert: {e}")),
+            }
         });
     }
 

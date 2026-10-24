@@ -181,6 +181,7 @@ pub fn build(app: &adw::Application) -> Rc<Window> {
             Event::Albums => win.rebuild_sidebar(),
             Event::Syncing(progress) => win.update_sync(*progress),
             Event::Toast(message) => win.toast(message),
+            Event::Edited(_) => {}
         }
     });
     win.rebuild_sidebar();

@@ -19,6 +19,9 @@ mod imp {
         pub asset: RefCell<Option<Asset>>,
         #[property(get, set)]
         pub favorite: Cell<bool>,
+        /// Bumped when what the item looks like changes (an edit), so cells redraw.
+        #[property(get, set)]
+        pub revision: Cell<u32>,
     }
 
     #[glib::object_subclass]

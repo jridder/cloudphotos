@@ -25,6 +25,9 @@ pub const THUMB: &str = "thumb";
 pub const PREVIEW: &str = "preview";
 pub const ORIGINAL: &str = "original";
 pub const LIVE: &str = "live";
+/// Rendered from the original when a photo is edited here.
+pub const EDITED_THUMB: &str = "edited_thumb";
+pub const EDITED_PREVIEW: &str = "edited_preview";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Resource {
@@ -61,6 +64,9 @@ pub struct Asset {
     /// zone, video duration… (see the helper's asset_details).
     #[serde(default)]
     pub details: serde_json::Value,
+    /// A local edit (rotate/flip/crop), if any.
+    #[serde(default)]
+    pub edit: Option<crate::edit::Recipe>,
 }
 
 impl Asset {
@@ -152,6 +158,13 @@ const SCHEMA: &str = "
         data BLOB NOT NULL,
         UNIQUE (asset_id, kind, part)
     );
+    -- Local, non-destructive edits; dropped if the original changes in iCloud.
+    CREATE TABLE IF NOT EXISTS edits (
+        asset_id TEXT PRIMARY KEY REFERENCES assets (id) ON DELETE CASCADE,
+        recipe TEXT NOT NULL,
+        base_checksum TEXT,
+        saved REAL NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS albums (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -226,8 +239,10 @@ impl Library {
             }
         }
         let Ok(mut stmt) = self.db.prepare(
-            "SELECT id, master, filename, kind, taken, added, width, height, size, live, favorite, details
-             FROM assets WHERE deleted = 0 ORDER BY taken DESC, id",
+            "SELECT a.id, a.master, a.filename, a.kind, a.taken, a.added, a.width, a.height, a.size, a.live, a.favorite,
+                    a.details, e.recipe
+             FROM assets a LEFT JOIN edits e ON e.asset_id = a.id
+             WHERE a.deleted = 0 ORDER BY a.taken DESC, a.id",
         ) else {
             return vec![];
         };
@@ -250,6 +265,7 @@ impl Library {
                     .get::<_, Option<String>>(11)?
                     .and_then(|d| serde_json::from_str(&d).ok())
                     .unwrap_or_default(),
+                edit: r.get::<_, Option<String>>(12)?.and_then(|e| serde_json::from_str(&e).ok()),
             })
         })
         .map(|rows| rows.flatten().collect())
@@ -350,8 +366,12 @@ impl Library {
                     details
                 ])?;
                 if diff_changed(&existing, a, &original) {
-                    // A new original means new EXIF.
+                    // A new original (edited on another device) means new
+                    // EXIF, and a local edit made against the old one no
+                    // longer fits.
                     tx.execute("UPDATE assets SET exif = NULL WHERE id = ?1", [&a.id])?;
+                    tx.execute("DELETE FROM edits WHERE asset_id = ?1", [&a.id])?;
+                    tx.execute("DELETE FROM blobs WHERE asset_id = ?1 AND kind IN ('edited_thumb', 'edited_preview')", [&a.id])?;
                 }
                 clear.execute([&a.id])?;
                 for (kind, r) in &a.resources {
@@ -414,6 +434,37 @@ impl Library {
         let _ = self.db.execute("UPDATE assets SET exif = ?2 WHERE id = ?1", params![id, exif.to_string()]);
     }
 
+    /// Add one item outside a scan (a copy just uploaded from here).
+    pub fn add_asset(&self, a: &Asset) -> rusqlite::Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO assets (id, master, filename, kind, taken, added, width, height, size, live, favorite, deleted, details)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)",
+            params![a.id, a.master, a.filename, a.kind, a.taken, a.added, a.width, a.height, a.size, a.live as i64, a.favorite as i64,
+                (!a.details.is_null()).then(|| a.details.to_string())],
+        )?;
+        for (kind, r) in &a.resources {
+            tx.execute(
+                "INSERT OR REPLACE INTO resources (asset_id, kind, size, width, height, uti, checksum) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![a.id, kind, r.size, r.width, r.height, r.kind, r.checksum],
+            )?;
+        }
+        tx.commit()
+    }
+
+    pub fn set_edit(&self, id: &str, recipe: &crate::edit::Recipe, base_checksum: Option<&str>) {
+        let _ = self.db.execute(
+            "INSERT OR REPLACE INTO edits (asset_id, recipe, base_checksum, saved) VALUES (?1, ?2, ?3, ?4)",
+            params![id, serde_json::to_string(recipe).unwrap_or_default(), base_checksum, gtk::glib::real_time() as f64 / 1e6],
+        );
+    }
+
+    /// Back to the original: the recipe and its rendered images go.
+    pub fn remove_edit(&self, id: &str) {
+        let _ = self.db.execute("DELETE FROM edits WHERE asset_id = ?1", [id]);
+        let _ = self.db.execute("DELETE FROM blobs WHERE asset_id = ?1 AND kind IN ('edited_thumb', 'edited_preview')", [id]);
+    }
+
     pub fn set_favorite(&self, id: &str, value: bool) {
         let _ = self.db.execute("UPDATE assets SET favorite = ?2 WHERE id = ?1", params![id, value as i64]);
     }
@@ -442,6 +493,15 @@ pub fn read_blob(db: &Connection, id: &str, kind: &str) -> Option<Vec<u8>> {
         .optional()
         .ok()
         .flatten()
+}
+
+/// Store small in-memory data (rendered thumbnails and previews).
+pub fn write_blob_bytes(db: &Connection, id: &str, kind: &str, data: &[u8]) -> rusqlite::Result<()> {
+    db.execute(
+        "INSERT OR REPLACE INTO blobs (asset_id, kind, checksum, saved, data) VALUES (?1, ?2, NULL, ?3, ?4)",
+        params![id, kind, gtk::glib::real_time() as f64 / 1e6, data],
+    )
+    .map(|_| ())
 }
 
 /// Largest piece stored in one row; bigger files are split across rows.
@@ -538,6 +598,7 @@ mod tests {
             favorite: false,
             resources,
             details: serde_json::Value::Null,
+            edit: None,
         }
     }
 
@@ -649,5 +710,25 @@ mod tests {
         let got = lib.albums();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].assets, ["b", "a"]);
+    }
+
+    #[test]
+    fn edits_survive_rescans_until_the_original_changes() {
+        let (_dir, mut lib) = setup();
+        lib.apply_scan(&[asset("a", "1")], &[], &[], "t1").unwrap();
+        let mut recipe = crate::edit::Recipe::default();
+        recipe.rotate_clockwise();
+        lib.set_edit("a", &recipe, Some("1-original"));
+        let db = connect(lib.path()).unwrap();
+        write_blob_bytes(&db, "a", EDITED_THUMB, b"jpeg").unwrap();
+
+        lib.apply_scan(&[asset("a", "1")], &[], &[], "t2").unwrap();
+        assert_eq!(lib.assets()[0].edit, Some(recipe));
+        assert!(lib.missing().iter().all(|(_, k)| k != EDITED_THUMB), "rendered edits aren't downloads");
+
+        // Edited on the phone: the local edit no longer applies.
+        lib.apply_scan(&[asset("a", "2")], &[], &[], "t3").unwrap();
+        assert_eq!(lib.assets()[0].edit, None);
+        assert!(read_blob(&db, "a", EDITED_THUMB).is_none());
     }
 }

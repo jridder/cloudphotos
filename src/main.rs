@@ -5,10 +5,12 @@
 //! reuses icloud-linux's sign-in.
 
 mod asset_object;
+mod edit;
 mod exif;
 mod helper;
 mod library;
 mod model;
+mod render;
 mod script;
 mod store;
 mod ui;

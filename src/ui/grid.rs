@@ -30,6 +30,21 @@ impl PhotoGrid {
             item.property_expression("item")
                 .chain_property::<AssetObject>("favorite")
                 .bind(&heart, "visible", gtk::Widget::NONE);
+            // An edit changes the thumbnail; GTK keeps the cell bound to the
+            // same object, so reload on the item's revision instead.
+            let (weak_item, weak_picture) = (item.downgrade(), picture.downgrade());
+            // GTK holds the watch for as long as it's installed.
+            item.property_expression("item").chain_property::<AssetObject>("revision").watch(
+                gtk::Widget::NONE,
+                move || {
+                    let (Some(item), Some(picture)) = (weak_item.upgrade(), weak_picture.upgrade()) else { return };
+                    let Some(object) = item.item().and_downcast::<AssetObject>() else { return };
+                    if object.revision() == 0 {
+                        return; // never edited; bind loads it
+                    }
+                    load_thumb(&item, &picture, object);
+                },
+            );
             item.set_child(Some(&square));
         });
         factory.connect_bind(|_, item| {
@@ -43,23 +58,7 @@ impl PhotoGrid {
             let (filename, taken) = object.with(|a| (a.filename.clone(), a.taken));
             cell.set_tooltip_text(Some(&format!("{filename}\n{}", format_date(taken))));
 
-            let model = model();
-            match model.store.cached(&object.id(), crate::library::THUMB) {
-                Some(texture) => picture.set_paintable(Some(&texture)),
-                None => {
-                    picture.set_paintable(None::<&gdk::Paintable>);
-                    let item = item.downgrade();
-                    let picture = picture.downgrade();
-                    glib::spawn_future_local(async move {
-                        let texture = model.texture(&object, crate::library::THUMB).await;
-                        // The cell may have been recycled for another item meanwhile.
-                        let (Some(item), Some(picture)) = (item.upgrade(), picture.upgrade()) else { return };
-                        if item.item().as_ref() == Some(object.upcast_ref()) {
-                            picture.set_paintable(texture.as_ref());
-                        }
-                    });
-                }
-            }
+            load_thumb(item, &picture, object);
         });
 
         let grid = gtk::GridView::builder()
@@ -98,6 +97,27 @@ impl PhotoGrid {
         self.grid.set_model(Some(&gtk::NoSelection::new(Some(items.clone()))));
         self.scroller.vadjustment().set_value(0.0);
         update_month(&self.grid, &self.month, &self.scroller.vadjustment());
+    }
+}
+
+/// Show the item's thumbnail (edited if it has an edit) in `picture`.
+fn load_thumb(item: &gtk::ListItem, picture: &gtk::Picture, object: AssetObject) {
+    let model = model();
+    match model.store.cached(&object.id(), crate::model::Model::display_kind(&object, crate::library::THUMB)) {
+        Some(texture) => picture.set_paintable(Some(&texture)),
+        None => {
+            picture.set_paintable(None::<&gdk::Paintable>);
+            let item = item.downgrade();
+            let picture = picture.downgrade();
+            glib::spawn_future_local(async move {
+                let texture = model.texture(&object, crate::library::THUMB).await;
+                // The cell may have been recycled for another item meanwhile.
+                let (Some(item), Some(picture)) = (item.upgrade(), picture.upgrade()) else { return };
+                if item.item().as_ref() == Some(object.upcast_ref()) {
+                    picture.set_paintable(texture.as_ref());
+                }
+            });
+        }
     }
 }
 
