@@ -1,0 +1,128 @@
+id: com.jridder.CloudPhotos
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: cloudphotos
+finish-args:
+  # iCloud (through the helper).
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Sound for videos and Live Photos.
+  - --socket=pulseaudio
+  # The library: ~/Pictures/iCloud Photos/Photos Library.sqlite.
+  - --filesystem=xdg-pictures/iCloud Photos:create
+  # icloud-linux's sign-in (config and session cookies), read only: the
+  # helper copies the session and never signs in with a password.
+  - --filesystem=~/.config/icloud-linux:ro
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /lib/cmake
+  - /share/thumbnailers
+  - '*.a'
+modules:
+  # HEIC decoding: the runtime's glycin-heif only does AVIF (no HEVC
+  # decoder), so the app ships libde265, libheif and its own heif loader.
+  - name: libde265
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DENABLE_SDL=OFF
+      - -DENABLE_DECODER=OFF
+      - -DENABLE_ENCODER=OFF
+    cleanup:
+      - /bin
+    sources:
+      - type: archive
+        url: https://github.com/strukturag/libde265/releases/download/v1.1.3/libde265-1.1.3.tar.gz
+        sha256: 554228bd17788c99a7e63b37ab5634722190e6e2bf60c1dcb01cef328e133905
+
+  - name: libheif
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DENABLE_PLUGIN_LOADING=OFF
+      - -DWITH_LIBDE265=ON
+      - -DWITH_DAV1D=ON
+      - -DWITH_X265=OFF
+      - -DWITH_X264=OFF
+      - -DWITH_OpenH264_DECODER=OFF
+      - -DWITH_AOM_DECODER=OFF
+      - -DWITH_AOM_ENCODER=OFF
+      - -DWITH_EXAMPLES=OFF
+      - -DWITH_GDK_PIXBUF=OFF
+      - -DBUILD_TESTING=OFF
+      - -DBUILD_DOCUMENTATION=OFF
+    sources:
+      - type: archive
+        url: https://github.com/strukturag/libheif/releases/download/v1.23.6/libheif-1.23.6.tar.gz
+        sha256: 4484346dc5995319dbc11e3a1c35d0a2ec46511ce370900869337fd2c7033125
+
+  - name: glycin-heif
+    buildsystem: meson
+    config-opts:
+      - -Dglycin-loaders=true
+      - -Dloaders=glycin-heif
+      - -Dlibglycin=false
+      - -Dlibglycin-gtk4=false
+      - -Dintrospection=false
+      - -Dvapi=false
+      - -Dtests=false
+      - -Dglycin-thumbnailer=false
+    sources:
+      - type: archive
+        url: https://download.gnome.org/sources/glycin/2.2/glycin-2.2.4.tar.xz
+        sha256: 3184e7c0f5fca272aee120d9646a2d160441b115cfeb6f9a75c9820be3b58bf5
+      # Its crates, vendored by make-flatpak.sh (.cargo/config.toml + vendor/).
+      - type: archive
+        path: glycin-vendor.tar.xz
+        strip-components: 0
+
+  # pyicloud and its dependencies, as wheels downloaded by make-flatpak.sh.
+  - name: python-deps
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-index --no-deps --prefix=${FLATPAK_DEST} *.whl
+    sources:
+      - type: archive
+        path: python-wheels.tar
+        strip-components: 0
+
+  - name: cloudphotos
+    buildsystem: simple
+    build-options:
+      env:
+        CARGO_HOME: /run/build/cloudphotos/cargo-home
+    build-commands:
+      - mkdir -p .cargo && cp vendor-config.toml .cargo/config.toml
+      - cargo build --release --frozen
+      - install -Dm755 target/release/cloudphotos -t /app/bin/
+      - install -Dm644 helper/photos_helper.py -t /app/libexec/cloudphotos/
+      - install -Dm644 data/${FLATPAK_ID}.desktop -t /app/share/applications/
+      - install -Dm644 data/${FLATPAK_ID}.metainfo.xml -t /app/share/metainfo/
+      - install -Dm644 data/icons/hicolor/scalable/apps/${FLATPAK_ID}.svg -t /app/share/icons/hicolor/scalable/apps/
+      - install -Dm644 data/icons/hicolor/symbolic/apps/*.svg -t /app/share/icons/hicolor/symbolic/apps/
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - .git
+          - target
+          - flatpak/.flatpak-builder
+          - flatpak/build-dir
+          - flatpak/repo
+          - flatpak/sources-probe
+          - flatpak/cloudphotos-vendor.tar.xz
+          - flatpak/glycin-vendor.tar.xz
+          - flatpak/python-wheels.tar
+      # vendor/ and the cargo config that points at it (make-flatpak.sh).
+      - type: archive
+        path: cloudphotos-vendor.tar.xz
+        strip-components: 0

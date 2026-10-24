@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.jridder.CloudPhotos</id>
+  <name>Cloud Photos</name>
+  <summary>Browse and edit your iCloud Photos library</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="com.jridder">
+    <name>Jeff Ridder</name>
+  </developer>
+  <description>
+    <p>
+      Cloud Photos keeps a complete copy of your iCloud Photos library on
+      your computer and lets you browse it: a timeline, your albums,
+      Favorites, Videos, Live Photos and Screenshots, and a full-window
+      viewer with zoom and video and Live Photo playback.
+    </p>
+    <p>
+      Edit photos without touching the original: crop, rotate, flip, adjust
+      light and color or pick a ready-made look, then undo, revert or save
+      a copy back to iCloud. You can also favorite, delete and export.
+    </p>
+    <p>
+      It reuses the sign-in of the iCloud Drive app (icloud-linux) and never
+      asks for or sends your Apple Account password.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.jridder.CloudPhotos.desktop</launchable>
+  <url type="homepage">https://github.com/jridder/cloudphotos</url>
+  <url type="bugtracker">https://github.com/jridder/cloudphotos/issues</url>
+  <content_rating type="oars-1.1"/>
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <releases>
+    <release version="0.1.0" date="2026-10-24">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

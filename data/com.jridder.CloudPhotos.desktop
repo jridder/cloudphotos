@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Cloud Photos
+Comment=Browse and edit your iCloud Photos library
+Exec=cloudphotos
+Icon=com.jridder.CloudPhotos
+Terminal=false
+Type=Application
+Categories=Graphics;Photography;GTK;GNOME;
+Keywords=iCloud;Photos;Pictures;Apple;Gallery;
+StartupNotify=true
+DBusActivatable=false

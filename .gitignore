@@ -1,2 +1,8 @@
 /target
 __pycache__/
+/flatpak/.flatpak-builder/
+/flatpak/build-dir/
+/flatpak/repo/
+/flatpak/sources-probe/
+/flatpak/*.tar
+/flatpak/*.tar.xz

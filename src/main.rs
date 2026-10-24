@@ -48,7 +48,7 @@ fn main() -> glib::ExitCode {
     app.connect_startup(|_| {
         let display = gdk::Display::default().expect("a display");
         // Running from the source tree; the Flatpak installs these into hicolor.
-        let icons = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/icons");
+        let icons = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/icons/hicolor/symbolic/apps");
         if icons.is_dir() {
             gtk::IconTheme::for_display(&display).add_search_path(icons);
         }
