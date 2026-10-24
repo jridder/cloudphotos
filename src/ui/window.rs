@@ -1,0 +1,290 @@
+//! Main window: sidebar of collections, the photo grid, and the viewer.
+
+use std::{cell::RefCell, rc::Rc};
+
+use adw::prelude::*;
+use gtk::{gio, glib};
+
+use crate::{
+    asset_object::AssetObject,
+    model::{Event, State, model},
+    ui::{grid::PhotoGrid, viewer},
+};
+
+/// What the sidebar can show.
+#[derive(Clone, PartialEq)]
+enum Collection {
+    Library,
+    Favorites,
+    Videos,
+    Album(String, String), // id, name
+}
+
+impl Collection {
+    fn title(&self) -> String {
+        match self {
+            Collection::Library => "Library".into(),
+            Collection::Favorites => "Favorites".into(),
+            Collection::Videos => "Videos".into(),
+            Collection::Album(_, name) => name.rsplit('/').next().unwrap_or(name).into(),
+        }
+    }
+
+    fn items(&self) -> gio::ListModel {
+        let model = model();
+        match self {
+            Collection::Library => model.all.clone().upcast(),
+            // Filters over the whole library, so favoriting updates them live.
+            Collection::Favorites => {
+                let filter = gtk::BoolFilter::new(Some(gtk::PropertyExpression::new(
+                    AssetObject::static_type(),
+                    gtk::Expression::NONE,
+                    "favorite",
+                )));
+                gtk::FilterListModel::new(Some(model.all.clone()), Some(filter)).upcast()
+            }
+            Collection::Videos => {
+                let filter = gtk::CustomFilter::new(|o| o.downcast_ref::<AssetObject>().is_some_and(|a| a.with(|x| x.is_video())));
+                gtk::FilterListModel::new(Some(model.all.clone()), Some(filter)).upcast()
+            }
+            Collection::Album(id, _) => model.album_items(id).upcast(),
+        }
+    }
+}
+
+pub struct Window {
+    pub window: adw::ApplicationWindow,
+    toasts: adw::ToastOverlay,
+    nav: adw::NavigationView,
+    sidebar: gtk::ListBox,
+    rows: RefCell<Vec<(gtk::ListBoxRow, Collection)>>,
+    grid: PhotoGrid,
+    stack: gtk::Stack,
+    status: adw::StatusPage,
+    title: adw::WindowTitle,
+    spinner: adw::Spinner,
+    refresh: gtk::Button,
+    current: RefCell<Collection>,
+    items: RefCell<Option<gio::ListModel>>,
+}
+
+pub fn build(app: &adw::Application) -> Rc<Window> {
+    let window = adw::ApplicationWindow::builder()
+        .application(app)
+        .title("Cloud Photos")
+        .default_width(1180)
+        .default_height(800)
+        .build();
+
+    // Sidebar
+    let sidebar = gtk::ListBox::new();
+    sidebar.add_css_class("navigation-sidebar");
+    let sidebar_view = adw::ToolbarView::new();
+    sidebar_view.add_top_bar(&adw::HeaderBar::new());
+    sidebar_view.set_content(Some(&gtk::ScrolledWindow::builder().child(&sidebar).vexpand(true).build()));
+    let sidebar_page = adw::NavigationPage::builder().title("Cloud Photos").child(&sidebar_view).build();
+
+    // Content: grid or a status page, under a header with the collection name.
+    let title = adw::WindowTitle::new("Library", "");
+    let spinner = adw::Spinner::builder().visible(false).build();
+    let refresh = gtk::Button::builder().icon_name("view-refresh-symbolic").tooltip_text("Check for New Photos").build();
+    let header = adw::HeaderBar::builder().title_widget(&title).build();
+    header.pack_end(&refresh);
+    header.pack_end(&spinner);
+
+    let window_ref: Rc<RefCell<Option<std::rc::Weak<Window>>>> = Rc::default();
+    let grid = {
+        let window_ref = window_ref.clone();
+        PhotoGrid::new(move |items, position| {
+            if let Some(win) = window_ref.borrow().as_ref().and_then(|w| w.upgrade()) {
+                viewer::open(&win.nav, &win.toasts, items, position);
+            }
+        })
+    };
+    let status = adw::StatusPage::new();
+    let stack = gtk::Stack::new();
+    stack.add_named(&grid.root, Some("grid"));
+    stack.add_named(&status, Some("status"));
+
+    let content_view = adw::ToolbarView::new();
+    content_view.add_top_bar(&header);
+    content_view.set_content(Some(&stack));
+    let content_page = adw::NavigationPage::builder().title("Library").tag("grid").child(&content_view).build();
+    let nav = adw::NavigationView::new();
+    nav.add(&content_page);
+
+    let split = adw::NavigationSplitView::builder()
+        .sidebar(&sidebar_page)
+        .content(&adw::NavigationPage::builder().title("Photos").child(&nav).build())
+        .min_sidebar_width(200.0)
+        .build();
+    let toasts = adw::ToastOverlay::new();
+    toasts.set_child(Some(&split));
+    window.set_content(Some(&toasts));
+
+    let win = Rc::new(Window {
+        window,
+        toasts,
+        nav,
+        sidebar,
+        rows: RefCell::default(),
+        grid,
+        stack,
+        status,
+        title,
+        spinner,
+        refresh,
+        current: RefCell::new(Collection::Library),
+        items: RefCell::default(),
+    });
+    window_ref.replace(Some(Rc::downgrade(&win)));
+
+    let weak = Rc::downgrade(&win);
+    win.sidebar.connect_row_selected(move |_, row| {
+        let (Some(win), Some(row)) = (weak.upgrade(), row) else { return };
+        let collection = win.rows.borrow().iter().find(|(r, _)| r == row).map(|(_, c)| c.clone());
+        if let Some(collection) = collection {
+            win.show(collection);
+        }
+    });
+    win.refresh.connect_clicked(|_| model().refresh());
+
+    let weak = Rc::downgrade(&win);
+    model().subscribe(move |event| {
+        let Some(win) = weak.upgrade() else { return };
+        match event {
+            Event::State => win.update_state(),
+            Event::Scanning(count) => win.update_scanning(*count),
+            Event::Albums => win.rebuild_sidebar(),
+            Event::Toast(message) => win.toast(message),
+        }
+    });
+    win.rebuild_sidebar();
+    win.show(Collection::Library);
+    win.update_state();
+    win
+}
+
+impl Window {
+    pub fn toast(&self, message: &str) {
+        self.toasts.add_toast(adw::Toast::builder().title(glib::markup_escape_text(message)).timeout(6).build());
+    }
+
+    fn rebuild_sidebar(&self) {
+        let current = self.current.borrow().clone();
+        while let Some(child) = self.sidebar.first_child() {
+            self.sidebar.remove(&child);
+        }
+        let mut rows = Vec::new();
+        let mut add = |label: &str, icon: &str, collection: Collection| {
+            let row = sidebar_row(label, icon);
+            self.sidebar.append(&row);
+            rows.push((row, collection));
+        };
+        add("Library", "image-x-generic-symbolic", Collection::Library);
+        add("Favorites", "cloudphotos-heart-filled-symbolic", Collection::Favorites);
+        add("Videos", "camera-video-symbolic", Collection::Videos);
+        let albums = model().albums();
+        for (name, icon) in [("Live", "camera-photo-symbolic"), ("Screenshots", "applets-screenshooter-symbolic")] {
+            if let Some(album) = albums.iter().find(|a| a.kind == "smart" && a.name == name) {
+                let label = if name == "Live" { "Live Photos" } else { name };
+                add(label, icon, Collection::Album(album.id.clone(), label.into()));
+            }
+        }
+        let user: Vec<_> = albums.iter().filter(|a| a.kind == "user").collect();
+        if !user.is_empty() {
+            let heading = gtk::Label::builder().label("Albums").xalign(0.0).margin_top(12).margin_start(12).build();
+            heading.add_css_class("heading");
+            heading.add_css_class("dimmed");
+            let row = gtk::ListBoxRow::builder().child(&heading).selectable(false).activatable(false).build();
+            self.sidebar.append(&row);
+            for album in user {
+                // Albums inside folders show as "Folder › Album".
+                let label = album.name.replace('/', " › ");
+                add(&label, "folder-pictures-symbolic", Collection::Album(album.id.clone(), album.name.clone()));
+            }
+        }
+        let selected = rows.iter().find(|(_, c)| *c == current).or(rows.first()).map(|(r, _)| r.clone());
+        self.rows.replace(rows);
+        if let Some(row) = selected {
+            self.sidebar.select_row(Some(&row));
+        }
+    }
+
+    fn show(&self, collection: Collection) {
+        let items = collection.items();
+        self.grid.set_model(&items);
+        self.title.set_title(&collection.title());
+        let count = items.n_items();
+        self.title.set_subtitle(&match count {
+            0 => String::new(),
+            1 => "1 item".into(),
+            n => format!("{n} items"),
+        });
+        let weak_title = self.title.downgrade();
+        items.connect_items_changed(move |items, _, _, _| {
+            if let Some(title) = weak_title.upgrade() {
+                let n = items.n_items();
+                title.set_subtitle(&if n == 1 { "1 item".into() } else { format!("{n} items") });
+            }
+        });
+        self.items.replace(Some(items));
+        self.current.replace(collection);
+        self.update_state();
+    }
+
+    fn update_state(&self) {
+        let state = model().state();
+        let empty = self.items.borrow().as_ref().is_none_or(|i| i.n_items() == 0);
+        self.refresh.set_sensitive(state == State::Ready && !model().is_scanning());
+        let page = match (&state, empty) {
+            (State::NeedsSetup(message), _) => Some(("Set Up iCloud Drive First", "dialog-information-symbolic", message.clone())),
+            (State::NeedsSignin(_), true) => Some((
+                "Sign In Again",
+                "dialog-password-symbolic",
+                "Open the iCloud Drive app and choose Sign In Again. Cloud Photos uses the same sign-in.".into(),
+            )),
+            (State::Offline(message), true) => Some(("Can't Reach iCloud", "network-offline-symbolic", message.clone())),
+            (State::Starting, true) => Some(("Connecting to iCloud…", "content-loading-symbolic", String::new())),
+            (State::Ready, true) if model().is_scanning() => None,
+            (State::Ready, true) => Some(("No Photos", "image-x-generic-symbolic", String::new())),
+            _ => None,
+        };
+        match page {
+            Some((title, icon, description)) => {
+                self.status.set_title(title);
+                self.status.set_icon_name(Some(icon));
+                self.status.set_description(Some(&glib::markup_escape_text(&description)));
+                self.stack.set_visible_child_name("status");
+            }
+            None => self.stack.set_visible_child_name("grid"),
+        }
+        if let State::NeedsSignin(_) = state {
+            if !empty {
+                self.toast("iCloud needs you to sign in again — use Sign In Again in the iCloud Drive app.");
+            }
+        }
+    }
+
+    fn update_scanning(&self, count: Option<usize>) {
+        self.spinner.set_visible(count.is_some());
+        self.refresh.set_visible(count.is_none());
+        if let Some(n) = count {
+            if self.items.borrow().as_ref().is_none_or(|i| i.n_items() == 0) {
+                self.stack.set_visible_child_name("status");
+                self.status.set_icon_name(Some("content-loading-symbolic"));
+                self.status.set_title("Loading Your Library…");
+                self.status.set_description(Some(&format!("{n} items so far")));
+            }
+        } else {
+            self.update_state();
+        }
+    }
+}
+
+fn sidebar_row(label: &str, icon: &str) -> gtk::ListBoxRow {
+    let row_box = gtk::Box::builder().spacing(12).margin_start(6).margin_end(6).margin_top(6).margin_bottom(6).build();
+    row_box.append(&gtk::Image::from_icon_name(icon));
+    row_box.append(&gtk::Label::builder().label(label).xalign(0.0).ellipsize(gtk::pango::EllipsizeMode::End).build());
+    gtk::ListBoxRow::builder().child(&row_box).build()
+}

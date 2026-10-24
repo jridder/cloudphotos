@@ -1,0 +1,28 @@
+.photo-grid > child {
+  padding: 1px;
+}
+
+.photo-cell {
+  background-color: alpha(currentColor, 0.08);
+}
+
+.photo-cell .badge {
+  color: white;
+  -gtk-icon-shadow: 0 1px 3px alpha(black, 0.6);
+}
+
+.month-label {
+  font-weight: bold;
+  padding: 4px 12px;
+  border-radius: 999px;
+}
+
+.viewer {
+  background-color: black;
+}
+
+.live-button {
+  font-weight: bold;
+  font-size: smaller;
+  letter-spacing: 1px;
+}
