@@ -30,43 +30,87 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, object: &Asse
     let done = gtk::Button::with_label("Done");
     done.add_css_class("suggested-action");
     let spinner = adw::Spinner::builder().visible(false).build();
-    let header = adw::HeaderBar::builder().show_start_title_buttons(false).show_end_title_buttons(false).build();
+    let header = adw::HeaderBar::builder()
+        .show_start_title_buttons(false)
+        .show_end_title_buttons(false)
+        .show_back_button(false) // Cancel does that
+        .build();
     header.pack_start(&cancel);
     header.pack_end(&done);
     header.pack_end(&spinner);
     header.set_title_widget(Some(&adw::WindowTitle::new("Edit", &object.with(|a| a.filename.clone()))));
 
-    let tool = |icon: &str, tip: &str| {
-        let b = gtk::Button::builder().icon_name(icon).tooltip_text(tip).build();
+    // Controls in a panel to the right of the photo, like the Info pane.
+    let tool = |icon: &str, label: &str| {
+        let content = adw::ButtonContent::builder().icon_name(icon).label(label).build();
+        let b = gtk::Button::builder().child(&content).hexpand(true).build();
         b.add_css_class("flat");
         b
     };
-    let rotate_left = tool("object-rotate-left-symbolic", "Rotate Left");
-    let rotate_right = tool("object-rotate-right-symbolic", "Rotate Right");
-    let flip_h = tool("object-flip-horizontal-symbolic", "Flip Horizontally");
-    let flip_v = tool("object-flip-vertical-symbolic", "Flip Vertically");
-    let aspect = gtk::DropDown::from_strings(&ASPECTS.map(|(label, _)| label));
-    aspect.set_tooltip_text(Some("Crop Shape"));
-    let reset = gtk::Button::with_label("Reset");
-    reset.add_css_class("flat");
+    let pair = |a: &gtk::Button, b: &gtk::Button| {
+        let row = gtk::Box::builder().spacing(6).homogeneous(true).build();
+        row.add_css_class("card");
+        row.append(a);
+        row.append(b);
+        row
+    };
+    let rotate_left = tool("object-rotate-left-symbolic", "Left");
+    let rotate_right = tool("object-rotate-right-symbolic", "Right");
+    let flip_h = tool("object-flip-horizontal-symbolic", "Horizontal");
+    let flip_v = tool("object-flip-vertical-symbolic", "Vertical");
 
-    let tools = gtk::Box::builder().spacing(6).halign(gtk::Align::Center).margin_top(6).margin_bottom(6).build();
-    for w in [rotate_left.upcast_ref::<gtk::Widget>(), rotate_right.upcast_ref(), flip_h.upcast_ref(), flip_v.upcast_ref()] {
-        tools.append(w);
+    let rotate_group = adw::PreferencesGroup::builder().title("Rotate").build();
+    rotate_group.add(&pair(&rotate_left, &rotate_right));
+    let flip_group = adw::PreferencesGroup::builder().title("Flip").build();
+    flip_group.add(&pair(&flip_h, &flip_v));
+
+    // Crop shapes as a list of choices; the first (Free) is selected.
+    let crop_group = adw::PreferencesGroup::builder().title("Crop").description("Drag the corners or edges of the box").build();
+    let mut shapes: Vec<gtk::CheckButton> = Vec::new();
+    for (label, _) in ASPECTS {
+        let check = gtk::CheckButton::builder().valign(gtk::Align::Center).build();
+        if let Some(first) = shapes.first() {
+            check.set_group(Some(first));
+        }
+        let row = adw::ActionRow::builder().title(label).activatable_widget(&check).build();
+        row.add_prefix(&check);
+        crop_group.add(&row);
+        shapes.push(check);
     }
-    tools.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-    tools.append(&gtk::Image::from_icon_name("cloudphotos-crop-symbolic"));
-    tools.append(&aspect);
-    tools.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-    tools.append(&reset);
-    let bottom = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    bottom.append(&tools);
+    shapes[0].set_active(true);
+
+    let reset = gtk::Button::builder().label("Reset All").halign(gtk::Align::Center).build();
+    reset.add_css_class("pill");
+
+    let panel_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(18)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(12)
+        .margin_bottom(12)
+        .build();
+    panel_box.append(&rotate_group);
+    panel_box.append(&flip_group);
+    panel_box.append(&crop_group);
+    panel_box.append(&reset);
+    let panel = gtk::ScrolledWindow::builder()
+        .child(&panel_box)
+        .width_request(300)
+        .hexpand(false)
+        .propagate_natural_width(false)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    panel.add_css_class("edit-panel");
+
+    let body = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    canvas.add_css_class("viewer");
+    body.append(&canvas);
+    body.append(&panel);
 
     let view = adw::ToolbarView::new();
     view.add_top_bar(&header);
-    view.add_bottom_bar(&bottom);
-    view.set_content(Some(&canvas));
-    view.add_css_class("viewer");
+    view.set_content(Some(&body));
     let page = adw::NavigationPage::builder().title("Edit").tag("editor").child(&view).build();
 
     // The unedited preview; the recipe is drawn on top of it live.
@@ -86,20 +130,25 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, object: &Asse
     flip_h.connect_clicked(move |_| c.modify(Recipe::flip_horizontally));
     let c = canvas.clone();
     flip_v.connect_clicked(move |_| c.modify(Recipe::flip_vertically));
-    let c = canvas.clone();
-    aspect.connect_selected_notify(move |dd| {
-        let (_, ratio) = ASPECTS[dd.selected() as usize];
-        let (ow, oh) = c.oriented_size();
-        let ratio = ratio.map(|r| match r {
-            0.0 => ow / oh,
-            r if oh > ow => 1.0 / r, // portrait picture: portrait crop
-            r => r,
+    for (index, check) in shapes.iter().enumerate() {
+        let c = canvas.clone();
+        check.connect_toggled(move |check| {
+            if !check.is_active() {
+                return;
+            }
+            let (_, ratio) = ASPECTS[index];
+            let (ow, oh) = c.oriented_size();
+            let ratio = ratio.map(|r| match r {
+                0.0 => ow / oh,
+                r if oh > ow => 1.0 / r, // portrait picture: portrait crop
+                r => r,
+            });
+            c.set_aspect(ratio);
         });
-        c.set_aspect(ratio);
-    });
-    let (c, a) = (canvas.clone(), aspect.clone());
+    }
+    let (c, free) = (canvas.clone(), shapes[0].clone());
     reset.connect_clicked(move |_| {
-        a.set_selected(0);
+        free.set_active(true);
         c.set_aspect(None);
         c.set_recipe(Recipe::default());
     });
