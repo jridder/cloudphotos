@@ -31,6 +31,10 @@ struct Viewer {
     next: gtk::Button,
     favorite_handler: RefCell<Option<glib::SignalHandlerId>>,
     loading: Cell<u64>,
+    /// The Live Photo clip already loaded for the current item, replayed on
+    /// later clicks rather than fetched again.
+    live_media: RefCell<Option<(String, gtk::MediaFile)>>,
+    live_pending: Cell<bool>,
 }
 
 pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::ListModel, position: u32) {
@@ -116,6 +120,8 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
         next,
         favorite_handler: RefCell::default(),
         loading: Cell::new(0),
+        live_media: RefCell::default(),
+        live_pending: Cell::new(false),
     });
 
     let v = viewer.clone();
@@ -240,6 +246,7 @@ impl Viewer {
         self.fill_info(&object);
         self.set_zoom(0.0);
         self.video.set_media_stream(None::<&gtk::MediaStream>);
+        self.live_media.replace(None);
         self.stack.set_visible_child_name("picture");
 
         // Thumbnail at once, then the sharper preview.
@@ -272,6 +279,10 @@ impl Viewer {
             self.toast("Couldn't load the video.");
             return;
         };
+        // The viewer may have moved on while the URL was fetched.
+        if self.object.borrow().as_ref() != Some(object) {
+            return;
+        }
         let media = gtk::MediaFile::for_file(&gio::File::for_uri(&url));
         if live {
             let stack = self.stack.clone();
@@ -280,6 +291,7 @@ impl Viewer {
                     stack.set_visible_child_name("picture");
                 }
             });
+            self.live_media.replace(Some((object.id(), media.clone())));
         }
         self.video.set_media_stream(Some(&media));
         self.stack.set_visible_child_name("video");
@@ -287,8 +299,21 @@ impl Viewer {
 
     fn play_live(self: &Rc<Self>) {
         let Some(object) = self.object.borrow().clone() else { return };
+        let loaded = self.live_media.borrow().as_ref().filter(|(id, _)| *id == object.id()).map(|(_, m)| m.clone());
+        if let Some(media) = loaded {
+            media.seek(0);
+            media.play();
+            self.stack.set_visible_child_name("video");
+            return;
+        }
+        if self.live_pending.replace(true) {
+            return; // already fetching it
+        }
         let this = self.clone();
-        glib::spawn_future_local(async move { this.play(&object, "live", true).await });
+        glib::spawn_future_local(async move {
+            this.play(&object, "live", true).await;
+            this.live_pending.set(false);
+        });
     }
 
     fn fit_scale(&self) -> f64 {
