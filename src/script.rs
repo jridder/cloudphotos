@@ -35,6 +35,12 @@ pub fn run(window: adw::ApplicationWindow) {
                         }
                     }
                 }
+                "focus" => {
+                    // focus TOOLTIP: focus that button, scrolling it into view.
+                    if let Some(button) = find_button(window.upcast_ref(), arg) {
+                        button.grab_focus();
+                    }
+                }
                 "click" => {
                     // click TOOLTIP: press the visible button with that tooltip.
                     if let Some(button) = find_button(window.upcast_ref(), arg) {

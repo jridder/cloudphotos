@@ -30,3 +30,21 @@
 .crop-canvas {
   background-color: black;
 }
+
+.look {
+  padding: 4px;
+}
+
+.look .look-thumb {
+  border-radius: 6px;
+}
+
+.look.chosen .look-thumb {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 1px;
+}
+
+.look.chosen label {
+  color: var(--accent-color);
+  font-weight: bold;
+}

@@ -1,4 +1,4 @@
-//! The edit page: rotate, flip and crop one photo.
+//! The edit page: rotate, flip, crop and color-correct one photo.
 
 use std::{
     cell::{Cell, RefCell},
@@ -83,12 +83,30 @@ const LIGHT: [(&str, f64, f64, Field); 4] = [
     ("Highlights", -1.0, 1.0, |a| &mut a.highlights),
     ("Shadows", -1.0, 1.0, |a| &mut a.shadows),
 ];
-const COLOR: [(&str, f64, f64, Field); 4] = [
+const COLOR: [(&str, f64, f64, Field); 5] = [
     ("Saturation", -1.0, 1.0, |a| &mut a.saturation),
     ("Vibrance", -1.0, 1.0, |a| &mut a.vibrance),
     ("Warmth", -1.0, 1.0, |a| &mut a.warmth),
     ("Tint", -1.0, 1.0, |a| &mut a.tint),
+    ("Sepia", 0.0, 1.0, |a| &mut a.sepia),
 ];
+
+/// Edge of the square previews on the Looks buttons, in pixels.
+const LOOK_EDGE: u32 = 160;
+
+/// A centered square of `image`, `LOOK_EDGE` on a side.
+fn look_square(image: &image::RgbaImage) -> image::RgbaImage {
+    let (w, h) = image.dimensions();
+    let side = w.min(h);
+    let square = image::imageops::crop_imm(image, (w - side) / 2, (h - side) / 2, side, side).to_image();
+    image::imageops::resize(&square, LOOK_EDGE, LOOK_EDGE, image::imageops::FilterType::Triangle)
+}
+
+fn memory_texture(image: image::RgbaImage) -> gtk::gdk::MemoryTexture {
+    let (w, h) = image.dimensions();
+    let bytes = glib::Bytes::from_owned(image.into_raw());
+    gtk::gdk::MemoryTexture::new(w as i32, h as i32, gtk::gdk::MemoryFormat::R8g8b8a8, &bytes, w as usize * 4)
+}
 
 fn slider_value_label(name: &str, v: f64) -> String {
     if name == "Exposure" { format!("{v:+.2}") } else { format!("{:+.0}", v * 100.0) }
@@ -121,13 +139,10 @@ impl ColorPreview {
             std::thread::spawn(move || {
                 let mut image = (*base).clone();
                 edit::apply_color(&mut image, &adjust, edit::Gamut::Srgb);
-                let (w, h) = image.dimensions();
-                let _ = tx.send_blocking((w, h, image.into_raw()));
+                let _ = tx.send_blocking(image);
             });
-            if let Ok((w, h, data)) = rx.recv().await {
-                let bytes = glib::Bytes::from_owned(data);
-                let texture = gtk::gdk::MemoryTexture::new(w as i32, h as i32, gtk::gdk::MemoryFormat::R8g8b8a8, &bytes, w as usize * 4);
-                this.canvas.set_texture(Some(texture.upcast_ref()));
+            if let Ok(image) = rx.recv().await {
+                this.canvas.set_texture(Some(memory_texture(image).upcast_ref()));
                 this.shown.set(Some(adjust));
             }
             this.busy.set(false);
@@ -226,6 +241,39 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, object: &Asse
         group.add(&list);
         group
     };
+    // Looks: one-click presets, each previewed on the photo itself.
+    let looks_group = adw::PreferencesGroup::builder().title("Looks").build();
+    let looks_box = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .homogeneous(true)
+        .min_children_per_line(3)
+        .max_children_per_line(3)
+        .column_spacing(4)
+        .row_spacing(4)
+        .build();
+    let mut looks: Vec<(gtk::Button, gtk::Picture)> = Vec::new();
+    for (name, _) in edit::LOOKS {
+        let picture = gtk::Picture::builder()
+            .content_fit(gtk::ContentFit::Cover)
+            .overflow(gtk::Overflow::Hidden)
+            .width_request(72)
+            .height_request(72)
+            .halign(gtk::Align::Center)
+            .build();
+        picture.add_css_class("look-thumb");
+        let label = gtk::Label::builder().label(name).ellipsize(gtk::pango::EllipsizeMode::End).build();
+        label.add_css_class("caption");
+        let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
+        content.append(&picture);
+        content.append(&label);
+        let button = gtk::Button::builder().child(&content).tooltip_text(name).build();
+        button.add_css_class("flat");
+        button.add_css_class("look");
+        looks_box.append(&button);
+        looks.push((button, picture));
+    }
+    looks_group.add(&looks_box);
+
     let light_group = slider_group("Light", &LIGHT);
     let color_group = slider_group("Color", &COLOR);
 
@@ -243,6 +291,7 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, object: &Asse
     panel_box.append(&rotate_group);
     panel_box.append(&flip_group);
     panel_box.append(&crop_group);
+    panel_box.append(&looks_group);
     panel_box.append(&light_group);
     panel_box.append(&color_group);
     panel_box.append(&reset);
@@ -276,6 +325,7 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, object: &Asse
     });
     let id = object.id();
     let (c, p) = (canvas.clone(), preview.clone());
+    let pictures: Vec<gtk::Picture> = looks.iter().map(|(_, picture)| picture.clone()).collect();
     glib::spawn_future_local(async move {
         let Ok(texture) = model().store.texture(&id, PREVIEW).await else { return };
         c.set_texture(Some(&texture));
@@ -284,10 +334,28 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, object: &Asse
         std::thread::spawn(move || {
             let _ = tx.send_blocking(edit::fit(&pixels, 1600));
         });
-        if let Ok(base) = rx.recv().await {
-            p.base.replace(Some(Arc::new(base)));
-            p.shown.set(Some(Adjustments::default()));
-            p.request(c.recipe().color);
+        let Ok(base) = rx.recv().await else { return };
+        let square = look_square(&base);
+        p.base.replace(Some(Arc::new(base)));
+        p.shown.set(Some(Adjustments::default()));
+        p.request(c.recipe().color);
+
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let rendered: Vec<image::RgbaImage> = edit::LOOKS
+                .iter()
+                .map(|(_, look)| {
+                    let mut image = square.clone();
+                    edit::apply_color(&mut image, look, edit::Gamut::Srgb);
+                    image
+                })
+                .collect();
+            let _ = tx.send_blocking(rendered);
+        });
+        if let Ok(rendered) = rx.recv().await {
+            for (picture, image) in pictures.iter().zip(rendered) {
+                picture.set_paintable(Some(&memory_texture(image)));
+            }
         }
     });
 
@@ -349,12 +417,28 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, object: &Asse
         });
         scale.add_controller(reset_one);
     }
+    // A look replaces the color adjustments (geometry stays) as one step.
+    let look_buttons: Vec<gtk::Button> = looks.iter().map(|(button, _)| button.clone()).collect();
+    for (button, (_, look)) in look_buttons.iter().zip(edit::LOOKS) {
+        let (h, settle) = (history.clone(), settle.clone());
+        button.connect_clicked(move |_| {
+            // Finish any slider burst first so it stays its own undo step.
+            if let Some((first, timer)) = settle.borrow_mut().take() {
+                timer.remove();
+                h.record(first);
+            }
+            h.step(|c| c.modify(|r| r.color = look));
+        });
+    }
     let (p, sl, syncing2) = (preview.clone(), sliders.clone(), syncing.clone());
     let weak_canvas = canvas.downgrade();
     canvas.connect_changed(move || {
         let Some(c) = weak_canvas.upgrade() else { return };
         let mut color = c.recipe().color;
         p.request(color);
+        for (button, (_, look)) in look_buttons.iter().zip(edit::LOOKS) {
+            if look == color { button.add_css_class("chosen") } else { button.remove_css_class("chosen") }
+        }
         syncing2.set(true);
         for (scale, _, _, field) in sl.iter() {
             let v = *field(&mut color) as f64;

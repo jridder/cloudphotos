@@ -44,6 +44,8 @@ pub struct Adjustments {
     pub vibrance: f32,
     pub warmth: f32,
     pub tint: f32,
+    /// Brown toning, 0..1 (1 = fully sepia).
+    pub sepia: f32,
 }
 
 impl Adjustments {
@@ -51,6 +53,27 @@ impl Adjustments {
         *self == Self::default()
     }
 }
+
+/// Ready-made looks: a name and the adjustments it sets. They're ordinary
+/// slider values, so a look can be fine-tuned after choosing it.
+pub const LOOKS: [(&str, Adjustments); 12] = {
+    const Z: Adjustments =
+        Adjustments { exposure: 0.0, contrast: 0.0, highlights: 0.0, shadows: 0.0, saturation: 0.0, vibrance: 0.0, warmth: 0.0, tint: 0.0, sepia: 0.0 };
+    [
+        ("Original", Z),
+        ("Vivid", Adjustments { contrast: 0.15, saturation: 0.2, vibrance: 0.35, ..Z }),
+        ("Vivid Warm", Adjustments { contrast: 0.15, saturation: 0.15, vibrance: 0.3, warmth: 0.3, ..Z }),
+        ("Vivid Cool", Adjustments { contrast: 0.15, saturation: 0.15, vibrance: 0.3, warmth: -0.3, ..Z }),
+        ("Warm", Adjustments { warmth: 0.45, vibrance: 0.1, ..Z }),
+        ("Cool", Adjustments { warmth: -0.4, tint: -0.05, ..Z }),
+        ("Dramatic", Adjustments { exposure: -0.15, contrast: 0.4, highlights: -0.35, shadows: -0.2, saturation: -0.1, ..Z }),
+        ("Soft", Adjustments { contrast: -0.35, highlights: -0.15, shadows: 0.35, saturation: -0.25, ..Z }),
+        ("Mono", Adjustments { saturation: -1.0, ..Z }),
+        ("Noir", Adjustments { exposure: -0.25, contrast: 0.55, shadows: -0.2, saturation: -1.0, ..Z }),
+        ("Silvertone", Adjustments { exposure: 0.1, contrast: -0.15, highlights: 0.15, shadows: 0.3, saturation: -1.0, ..Z }),
+        ("Sepia", Adjustments { contrast: 0.1, sepia: 1.0, ..Z }),
+    ]
+};
 
 /// The primaries the pixel values are encoded in (both use the sRGB curve).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -244,7 +267,7 @@ pub fn apply_color(image: &mut RgbaImage, adjust: &Adjustments, gamut: Gamut) {
     let norm = 0.2126 * wr + 0.7152 * wg + 0.0722 * wb;
     let gain = 2f32.powf(a.exposure);
     let (wr, wg, wb) = (wr / norm * gain, wg / norm * gain, wb / norm * gain);
-    let tone = a.contrast != 0.0 || a.highlights != 0.0 || a.shadows != 0.0 || a.saturation != 0.0 || a.vibrance != 0.0;
+    let tone = a.contrast != 0.0 || a.highlights != 0.0 || a.shadows != 0.0 || a.saturation != 0.0 || a.vibrance != 0.0 || a.sepia != 0.0;
 
     image.par_chunks_mut(4).for_each(|px| {
         let mut rgb = [lut[px[0] as usize] * wr, lut[px[1] as usize] * wg, lut[px[2] as usize] * wb];
@@ -270,6 +293,14 @@ pub fn apply_color(image: &mut RgbaImage, adjust: &Adjustments, gamut: Gamut) {
             }
             ca *= scale.max(0.0);
             cb *= scale.max(0.0);
+            if a.sepia != 0.0 {
+                // Replace the color with a warm brown, strongest in the mid
+                // tones so whites and blacks stay clean.
+                let s = a.sepia.clamp(0.0, 1.0);
+                let mid = (4.0 * l * (1.0 - l)).clamp(0.0, 1.0);
+                ca = ca * (1.0 - s) + s * 0.012 * mid;
+                cb = cb * (1.0 - s) + s * 0.045 * mid;
+            }
             rgb = from_oklab([l, ca, cb]);
             if gamut == Gamut::DisplayP3 {
                 rgb = mul(&SRGB_TO_P3, rgb);
@@ -534,5 +565,19 @@ mod tests {
         assert_eq!(Gamut::from_icc(Some(b"....desc....Display P3....")), Gamut::DisplayP3);
         assert_eq!(Gamut::from_icc(Some(b"sRGB IEC61966-2.1")), Gamut::Srgb);
         assert_eq!(Gamut::from_icc(None), Gamut::Srgb);
+    }
+
+    #[test]
+    fn mono_and_sepia_looks() {
+        let look = |name: &str| LOOKS.iter().find(|(n, _)| *n == name).unwrap().1;
+        let mut mono = RgbaImage::from_pixel(1, 1, image::Rgba([200, 80, 40, 255]));
+        apply_color(&mut mono, &look("Mono"), Gamut::Srgb);
+        let m = mono.get_pixel(0, 0);
+        assert!(m[0].abs_diff(m[1]) <= 2 && m[1].abs_diff(m[2]) <= 2, "{m:?}");
+        let mut sepia = RgbaImage::from_pixel(1, 1, image::Rgba([60, 120, 200, 255]));
+        apply_color(&mut sepia, &look("Sepia"), Gamut::Srgb);
+        let s = sepia.get_pixel(0, 0);
+        assert!(s[0] > s[1] && s[1] > s[2], "{s:?}");
+        assert!(look("Original").is_identity());
     }
 }
