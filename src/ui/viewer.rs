@@ -11,7 +11,7 @@ use crate::{
     model::model,
     store,
     model::Event,
-    ui::{editor, grid::format_date, info},
+    ui::{grid::format_date, info, photo_actions},
 };
 
 struct Viewer {
@@ -156,8 +156,9 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
     export.connect_clicked(move |_| v.export());
     let v = viewer.clone();
     edit.connect_clicked(move |_| {
-        let (Some(object), Some(nav)) = (v.object.borrow().clone(), v.page.parent().and_downcast::<adw::NavigationView>()) else { return };
-        editor::open(&nav, &v.toasts, &object);
+        if let Some(target) = v.target() {
+            photo_actions::edit(&target);
+        }
     });
     let v = viewer.clone();
     show_original.connect_toggled(move |button| v.compare(button.is_active()));
@@ -165,6 +166,9 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
         ("save-copy", Viewer::save_copy as fn(&Rc<Viewer>)),
         ("revert", Viewer::revert),
         ("undo-edit", Viewer::undo_edit),
+        ("delete", Viewer::confirm_delete),
+        // The right-click menu, from the keyboard (Menu, Shift+F10).
+        ("menu", Viewer::menu_at_center),
     ] {
         let action = gio::SimpleAction::new(name, None);
         let v = viewer.clone();
@@ -172,6 +176,14 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
         viewer.actions.add_action(&action);
     }
     page.insert_action_group("viewer", Some(&viewer.actions));
+    let shortcuts = gtk::ShortcutController::new();
+    shortcuts.set_scope(gtk::ShortcutScope::Managed);
+    for (trigger, action) in [("Delete|KP_Delete", "viewer.delete"), ("Menu|<Shift>F10", "viewer.menu")] {
+        shortcuts.add_shortcut(gtk::Shortcut::new(gtk::ShortcutTrigger::parse_string(trigger), Some(gtk::NamedAction::new(action))));
+    }
+    page.add_controller(shortcuts);
+    let v = viewer.clone();
+    photo_actions::on_context_click(&overlay, move |x, y| v.menu(x, y));
     // Show a newly saved edit straight away.
     let weak = Rc::downgrade(&viewer);
     model().subscribe(move |event| {
@@ -411,11 +423,31 @@ impl Viewer {
     }
 
     fn toggle_favorite(self: &Rc<Self>, value: bool) {
-        let Some(object) = self.object.borrow().clone() else { return };
-        if object.favorite() == value {
-            return;
+        if let Some(object) = self.object.borrow().clone() {
+            photo_actions::set_favorite(&object, value);
         }
-        glib::spawn_future_local(async move { model().set_favorite(&object, value).await });
+    }
+
+    /// The current item as an action target.
+    fn target(&self) -> Option<photo_actions::Target> {
+        Some(photo_actions::Target {
+            nav: self.page.parent().and_downcast::<adw::NavigationView>()?,
+            toasts: self.toasts.clone(),
+            items: self.items.clone(),
+            object: self.object.borrow().clone()?,
+        })
+    }
+
+    fn menu(self: &Rc<Self>, x: f64, y: f64) {
+        let Some(target) = self.target() else { return };
+        let this = self.clone();
+        let anchor = self.stack.parent().expect("overlay");
+        photo_actions::popup(&anchor, x, y, target, None, Rc::new(move || this.after_delete()));
+    }
+
+    fn menu_at_center(self: &Rc<Self>) {
+        let anchor = self.stack.parent().expect("overlay");
+        self.menu(anchor.width() as f64 / 2.0, anchor.height() as f64 / 2.0);
     }
 
     fn toast(&self, message: &str) {
@@ -423,86 +455,21 @@ impl Viewer {
     }
 
     fn export(self: &Rc<Self>) {
-        let Some(object) = self.object.borrow().clone() else { return };
-        if object.with(|a| a.edit.is_none()) {
-            return self.export_as(object, false);
+        if let Some(object) = self.object.borrow().clone() {
+            photo_actions::export(self.page.upcast_ref(), &self.toasts, &object);
         }
-        let dialog = adw::AlertDialog::builder()
-            .heading("Export Which Version?")
-            .body("The edited photo is saved as a full-resolution JPEG with the original's date, camera and location.")
-            .build();
-        dialog.add_responses(&[("cancel", "Cancel"), ("original", "Original"), ("edited", "Edited")]);
-        dialog.set_response_appearance("edited", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("edited"));
-        let this = self.clone();
-        dialog.connect_response(None, move |_, response| match response {
-            "edited" => this.export_as(object.clone(), true),
-            "original" => this.export_as(object.clone(), false),
-            _ => {}
-        });
-        dialog.present(Some(&self.page));
-    }
-
-    fn export_as(self: &Rc<Self>, object: AssetObject, edited: bool) {
-        let filename = object.with(|a| a.filename.clone());
-        let name = if edited {
-            let stem = std::path::Path::new(&filename).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            format!("{stem} (Edited).jpg")
-        } else {
-            filename
-        };
-        let dialog = gtk::FileDialog::builder()
-            .title(if edited { "Export Edited Photo" } else { "Export Original" })
-            .initial_name(name)
-            .accept_label("Export")
-            .build();
-        let root = self.page.root().and_downcast::<gtk::Window>();
-        let this = self.clone();
-        dialog.save(root.as_ref(), gio::Cancellable::NONE, move |result| {
-            let Ok(file) = result else { return };
-            let Some(path) = file.path() else { return };
-            glib::spawn_future_local(async move {
-                if edited {
-                    this.toast("Exporting…");
-                    match model().render_edited(&object, path).await {
-                        Ok(_) => this.toast("Exported."),
-                        Err(e) => this.toast(&format!("Export failed: {e}")),
-                    }
-                    return;
-                }
-                match model().store.copy_out(&object.id(), ORIGINAL, path).await {
-                    Ok(_) => this.toast("Exported."),
-                    Err(store::Error::Missing) => {
-                        this.toast("The original hasn't been downloaded yet; try again once the sync reaches it.")
-                    }
-                    Err(e) => this.toast(&format!("Export failed: {e:?}")),
-                }
-            });
-        });
     }
 
     fn save_copy(self: &Rc<Self>) {
-        let Some(object) = self.object.borrow().clone() else { return };
-        let this = self.clone();
-        self.toast("Saving a copy to iCloud…");
-        glib::spawn_future_local(async move {
-            match model().save_copy_to_icloud(&object).await {
-                Ok(()) => this.toast("Saved to iCloud as a new photo."),
-                Err(e) => this.toast(&format!("Couldn't save to iCloud: {e}")),
-            }
-        });
+        if let Some(object) = self.object.borrow().clone() {
+            photo_actions::save_copy(&self.toasts, &object);
+        }
     }
 
     fn undo_edit(self: &Rc<Self>) {
-        let Some(object) = self.object.borrow().clone() else { return };
-        let this = self.clone();
-        glib::spawn_future_local(async move {
-            match model().undo_edit(&object).await {
-                Ok(true) => this.toast(if object.with(|a| a.edit.is_none()) { "Back to the original." } else { "Undid the last edit." }),
-                Ok(false) => {}
-                Err(e) => this.toast(&format!("Couldn't undo: {e}")),
-            }
-        });
+        if let Some(object) = self.object.borrow().clone() {
+            photo_actions::undo_edit(&self.toasts, &object);
+        }
     }
 
     /// While on, show the untouched original's preview instead of the edit.
@@ -526,52 +493,23 @@ impl Viewer {
     }
 
     fn revert(self: &Rc<Self>) {
-        let Some(object) = self.object.borrow().clone() else { return };
-        let this = self.clone();
-        glib::spawn_future_local(async move {
-            match model().save_edit(&object, crate::edit::Recipe::default()).await {
-                Ok(()) => this.toast("Reverted to the original."),
-                Err(e) => this.toast(&format!("Couldn't revert: {e}")),
-            }
-        });
+        if let Some(object) = self.object.borrow().clone() {
+            photo_actions::revert(&self.toasts, &object);
+        }
     }
 
     fn confirm_delete(self: &Rc<Self>) {
-        let Some(object) = self.object.borrow().clone() else { return };
-        let what = if object.with(|a| a.is_video()) { "Video" } else { "Photo" };
-        let dialog = adw::AlertDialog::builder()
-            .heading(format!("Delete This {what}?"))
-            .body("It moves to Recently Deleted in iCloud Photos on all your devices, where you can recover it for 30 days.")
-            .build();
-        dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
-        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
+        let Some(target) = self.target() else { return };
         let this = self.clone();
-        dialog.connect_response(None, move |_, response| {
-            if response != "delete" {
-                return;
-            }
-            let this = this.clone();
-            let object = object.clone();
-            glib::spawn_future_local(async move {
-                if !model().delete(&object).await {
-                    return;
-                }
-                // Album views hold their own list; drop it there too.
-                if let Some(store) = this.items.downcast_ref::<gio::ListStore>() {
-                    if let Some(pos) = store.find(&object) {
-                        store.remove(pos);
-                    }
-                }
-                let position = this.position.get().min(this.items.n_items().saturating_sub(1));
-                if this.items.n_items() == 0 {
-                    this.close();
-                } else {
-                    this.show(position);
-                }
-                this.toast("Moved to Recently Deleted.");
-            });
-        });
-        dialog.present(Some(&self.page));
+        photo_actions::confirm_delete(self.page.upcast_ref(), &target, move || this.after_delete());
+    }
+
+    /// Move on to the neighbour once the current item is gone.
+    fn after_delete(self: &Rc<Self>) {
+        if self.items.n_items() == 0 {
+            self.close();
+        } else {
+            self.show(self.position.get().min(self.items.n_items() - 1));
+        }
     }
 }

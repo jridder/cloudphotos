@@ -35,6 +35,30 @@ pub fn run(window: adw::ApplicationWindow) {
                         }
                     }
                 }
+                "menu" => {
+                    // menu N: right-click menu of grid cell N (of those shown);
+                    // "menu" alone: the open viewer's.
+                    if arg.is_empty() {
+                        if let Some(page) = find_page(window.upcast_ref()) {
+                            let _ = page.activate_action("viewer.menu", None);
+                        }
+                    } else if let Some(grid) = find::<gtk::GridView>(window.upcast_ref()) {
+                        let mut cell = grid.first_child();
+                        for _ in 0..arg.parse::<usize>().unwrap_or(0) {
+                            cell = cell.and_then(|c| c.next_sibling());
+                        }
+                        if let Some(content) = cell.and_then(|c| c.first_child()) {
+                            let _ = content.activate_action("cell.menu", None);
+                        }
+                    }
+                }
+                "menuitem" => {
+                    // menuitem NAME: choose photo.NAME in the open menu.
+                    if let Some(menu) = find::<gtk::PopoverMenu>(window.upcast_ref()) {
+                        let _ = menu.activate_action(&format!("photo.{arg}"), None);
+                        menu.popdown();
+                    }
+                }
                 "respond" => {
                     // respond ID: answer the open alert dialog (e.g. "respond delete").
                     if let Some(dialog) = find::<adw::AlertDialog>(window.upcast_ref()) {
@@ -105,6 +129,16 @@ fn shot(window: &adw::ApplicationWindow, path: &str) {
     let texture = renderer.render_texture(&node, Some(&graphene::Rect::new(0.0, 0.0, w as f32, h as f32)));
     if let Err(e) = texture.save_to_png(path) {
         eprintln!("CLOUDPHOTOS_SCRIPT: {e}");
+    }
+    // Popovers are surfaces of their own; save an open menu beside the shot.
+    if let Some(menu) = find::<gtk::PopoverMenu>(window.upcast_ref()) {
+        let (w, h) = (menu.width().max(1), menu.height().max(1));
+        let snapshot = gtk::Snapshot::new();
+        gtk::WidgetPaintable::new(Some(&menu)).snapshot(&snapshot, w as f64, h as f64);
+        if let (Some(node), Some(renderer)) = (snapshot.to_node(), window.renderer()) {
+            let texture = renderer.render_texture(&node, Some(&graphene::Rect::new(0.0, 0.0, w as f32, h as f32)));
+            let _ = texture.save_to_png(path.replace(".png", "-menu.png"));
+        }
     }
 }
 

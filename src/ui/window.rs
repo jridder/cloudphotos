@@ -8,7 +8,7 @@ use gtk::{gio, glib};
 use crate::{
     asset_object::AssetObject,
     model::{Event, State, model},
-    ui::{grid::PhotoGrid, viewer},
+    ui::{grid::PhotoGrid, photo_actions, viewer},
 };
 
 /// What the sidebar can show.
@@ -114,12 +114,19 @@ pub fn build(app: &adw::Application) -> Rc<Window> {
 
     let window_ref: Rc<RefCell<Option<std::rc::Weak<Window>>>> = Rc::default();
     let grid = {
-        let window_ref = window_ref.clone();
-        PhotoGrid::new(move |items, position| {
-            if let Some(win) = window_ref.borrow().as_ref().and_then(|w| w.upgrade()) {
-                viewer::open(&win.nav, &win.toasts, items, position);
-            }
-        })
+        let (open_ref, menu_ref) = (window_ref.clone(), window_ref.clone());
+        PhotoGrid::new(
+            move |items, position| {
+                if let Some(win) = open_ref.borrow().as_ref().and_then(|w| w.upgrade()) {
+                    viewer::open(&win.nav, &win.toasts, items, position);
+                }
+            },
+            move |object, cell, x, y| {
+                if let Some(win) = menu_ref.borrow().as_ref().and_then(|w| w.upgrade()) {
+                    win.photo_menu(object, cell, x, y);
+                }
+            },
+        )
     };
     let status = adw::StatusPage::new();
     let stack = gtk::Stack::new();
@@ -192,6 +199,19 @@ pub fn build(app: &adw::Application) -> Rc<Window> {
 }
 
 impl Window {
+    /// The right-click menu for a photo in the grid.
+    fn photo_menu(&self, object: &AssetObject, cell: &gtk::Widget, x: f64, y: f64) {
+        let Some(items) = self.items.borrow().clone() else { return };
+        let target = photo_actions::Target { nav: self.nav.clone(), toasts: self.toasts.clone(), items: items.clone(), object: object.clone() };
+        let (nav, toasts, o) = (self.nav.clone(), self.toasts.clone(), object.clone());
+        let open = Rc::new(move || {
+            if let Some(position) = (0..items.n_items()).find(|&i| items.item(i).as_ref() == Some(o.upcast_ref())) {
+                viewer::open(&nav, &toasts, &items, position);
+            }
+        });
+        photo_actions::popup(cell, x, y, target, Some(open), Rc::new(|| {}));
+    }
+
     pub fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::builder().title(glib::markup_escape_text(message)).timeout(6).build());
     }

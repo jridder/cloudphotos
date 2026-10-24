@@ -1,8 +1,10 @@
 //! The thumbnail grid used by the library and every album.
 
+use std::rc::Rc;
+
 use gtk::{gdk, gio, glib, prelude::*};
 
-use crate::{asset_object::AssetObject, model::model};
+use crate::{asset_object::AssetObject, model::model, ui::photo_actions};
 
 pub const CELL: i32 = 168;
 
@@ -14,9 +16,14 @@ pub struct PhotoGrid {
 }
 
 impl PhotoGrid {
-    pub fn new(on_activate: impl Fn(&gio::ListModel, u32) + 'static) -> Self {
+    /// `on_menu(object, widget, x, y)` shows the right-click menu for an item.
+    pub fn new(
+        on_activate: impl Fn(&gio::ListModel, u32) + 'static,
+        on_menu: impl Fn(&AssetObject, &gtk::Widget, f64, f64) + 'static,
+    ) -> Self {
+        let on_menu: Rc<dyn Fn(&AssetObject, &gtk::Widget, f64, f64)> = Rc::new(on_menu);
         let factory = gtk::SignalListItemFactory::new();
-        factory.connect_setup(|_, item| {
+        factory.connect_setup(move |_, item| {
             let item = item.downcast_ref::<gtk::ListItem>().expect("list item");
             let picture = gtk::Picture::builder().content_fit(gtk::ContentFit::Cover).can_shrink(true).build();
             let cell = gtk::Overlay::builder().child(&picture).width_request(CELL).height_request(CELL).build();
@@ -45,6 +52,26 @@ impl PhotoGrid {
                     load_thumb(&item, &picture, object);
                 },
             );
+            // Right-click or long-press, and the cell.menu action (keyboard
+            // Menu / Shift+F10 from the grid) open the photo's menu.
+            let (weak_item, menu) = (item.downgrade(), on_menu.clone());
+            photo_actions::on_context_click(&square, move |x, y| {
+                let Some(item) = weak_item.upgrade() else { return };
+                if let (Some(object), Some(cell)) = (item.item().and_downcast::<AssetObject>(), item.child()) {
+                    menu(&object, &cell, x, y);
+                }
+            });
+            let (weak_item, menu) = (item.downgrade(), on_menu.clone());
+            let action = gio::SimpleAction::new("menu", None);
+            action.connect_activate(move |_, _| {
+                let Some(item) = weak_item.upgrade() else { return };
+                if let (Some(object), Some(cell)) = (item.item().and_downcast::<AssetObject>(), item.child()) {
+                    menu(&object, &cell, cell.width() as f64 / 2.0, cell.height() as f64 / 2.0);
+                }
+            });
+            let actions = gio::SimpleActionGroup::new();
+            actions.add_action(&action);
+            square.insert_action_group("cell", Some(&actions));
             item.set_child(Some(&square));
         });
         factory.connect_bind(|_, item| {
@@ -68,6 +95,18 @@ impl PhotoGrid {
             .min_columns(2)
             .build();
         grid.add_css_class("photo-grid");
+        let shortcuts = gtk::ShortcutController::new();
+        shortcuts.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string("Menu|<Shift>F10"),
+            Some(gtk::CallbackAction::new(|grid, _| {
+                // The focused cell's content carries the cell.menu action.
+                if let Some(cell) = grid.focus_child().and_then(|c| c.first_child()) {
+                    let _ = cell.activate_action("cell.menu", None);
+                }
+                glib::Propagation::Stop
+            })),
+        ));
+        grid.add_controller(shortcuts);
         grid.connect_activate(move |grid, position| {
             if let Some(model) = grid.model() {
                 on_activate(&model.upcast(), position);
