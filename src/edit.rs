@@ -352,6 +352,98 @@ pub fn encode_jpeg(image: &RgbaImage, quality: u8, exif: Option<&[u8]>, icc: Opt
     }
 }
 
+/// Lossless PNG, carrying the EXIF (upright) and ICC profile when given.
+pub fn encode_png(image: &RgbaImage, exif: Option<&[u8]>, icc: Option<&[u8]>) -> Vec<u8> {
+    use image::ImageEncoder;
+    let rgb = image::DynamicImage::ImageRgba8(image.clone()).to_rgb8();
+    let mut out = Vec::new();
+    let mut encoder = image::codecs::png::PngEncoder::new(&mut out);
+    if let Some(icc) = icc {
+        let _ = encoder.set_icc_profile(icc.to_vec());
+    }
+    if let Some(tiff) = exif {
+        let mut tiff = tiff.to_vec();
+        set_orientation_upright(&mut tiff);
+        let _ = encoder.set_exif_metadata(tiff);
+    }
+    encoder.write_image(&rgb, rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8).expect("encode PNG into memory");
+    out
+}
+
+/// Uncompressed TIFF with the ICC profile (the encoder can't carry EXIF).
+pub fn encode_tiff(image: &RgbaImage, icc: Option<&[u8]>) -> Vec<u8> {
+    use image::ImageEncoder;
+    let rgb = image::DynamicImage::ImageRgba8(image.clone()).to_rgb8();
+    let mut out = std::io::Cursor::new(Vec::new());
+    let mut encoder = image::codecs::tiff::TiffEncoder::new(&mut out);
+    if let Some(icc) = icc {
+        let _ = encoder.set_icc_profile(icc.to_vec());
+    }
+    encoder.write_image(&rgb, rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8).expect("encode TIFF into memory");
+    out.into_inner()
+}
+
+/// A raw TIFF/EXIF block without its GPS data: the GPS IFD's entries and
+/// values are zeroed and IFD0's pointer to it is removed.
+pub fn without_location(mut tiff: Vec<u8>) -> Vec<u8> {
+    const GPS_IFD: u16 = 0x8825;
+    if tiff.len() < 8 {
+        return tiff;
+    }
+    let little = &tiff[0..2] == b"II";
+    let u16_at = |b: &[u8], i: usize| if little { u16::from_le_bytes([b[i], b[i + 1]]) } else { u16::from_be_bytes([b[i], b[i + 1]]) };
+    let u32_at = |b: &[u8], i: usize| {
+        let a = [b[i], b[i + 1], b[i + 2], b[i + 3]];
+        if little { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) }
+    };
+    let ifd = u32_at(&tiff, 4) as usize;
+    if ifd + 2 > tiff.len() {
+        return tiff;
+    }
+    let count = u16_at(&tiff, ifd) as usize;
+    let end = ifd + 2 + count * 12 + 4; // entries, then the next-IFD offset
+    if end > tiff.len() {
+        return tiff;
+    }
+    let Some(i) = (0..count).find(|i| u16_at(&tiff, ifd + 2 + i * 12) == GPS_IFD) else { return tiff };
+    let entry = ifd + 2 + i * 12;
+
+    // Zero the GPS IFD: its values stored elsewhere, then its entries.
+    let gps = u32_at(&tiff, entry + 8) as usize;
+    if gps + 2 <= tiff.len() {
+        let n = u16_at(&tiff, gps) as usize;
+        for j in 0..n {
+            let e = gps + 2 + j * 12;
+            if e + 12 > tiff.len() {
+                break;
+            }
+            let unit = match u16_at(&tiff, e + 2) {
+                1 | 2 | 6 | 7 => 1,
+                3 | 8 => 2,
+                4 | 9 | 11 => 4,
+                5 | 10 | 12 => 8,
+                _ => 0,
+            };
+            let size = unit * u32_at(&tiff, e + 4) as usize;
+            if size > 4 {
+                let at = u32_at(&tiff, e + 8) as usize;
+                if let Some(values) = tiff.get_mut(at..at.saturating_add(size)) {
+                    values.fill(0);
+                }
+            }
+        }
+        let stop = (gps + 2 + n * 12 + 4).min(tiff.len());
+        tiff[gps..stop].fill(0);
+    }
+
+    // Drop the pointer: later entries and the next-IFD offset move up.
+    tiff.copy_within(entry + 12..end, entry);
+    tiff[end - 12..end].fill(0);
+    let fewer = (count - 1) as u16;
+    tiff[ifd..ifd + 2].copy_from_slice(&if little { fewer.to_le_bytes() } else { fewer.to_be_bytes() });
+    tiff
+}
+
 /// Insert the ICC profile as APP2 "ICC_PROFILE" segments after SOI, so
 /// viewers show Display P3 colors as such.
 pub fn with_icc(jpeg: Vec<u8>, icc: &[u8]) -> Vec<u8> {
@@ -579,5 +671,61 @@ mod tests {
         let s = sepia.get_pixel(0, 0);
         assert!(s[0] > s[1] && s[1] > s[2], "{s:?}");
         assert!(look("Original").is_identity());
+    }
+
+    /// A little-endian EXIF block: IFD0 with Make and a GPS pointer, and a
+    /// GPS IFD holding a latitude (three rationals, stored out of line).
+    fn exif_with_gps() -> Vec<u8> {
+        let mut t = Vec::new();
+        t.extend_from_slice(b"II*\0");
+        t.extend_from_slice(&8u32.to_le_bytes());
+        // IFD0 at 8: 2 entries.
+        t.extend_from_slice(&2u16.to_le_bytes());
+        t.extend_from_slice(&[0x0f, 0x01, 2, 0]); // Make, ASCII
+        t.extend_from_slice(&4u32.to_le_bytes());
+        t.extend_from_slice(b"Cam\0");
+        t.extend_from_slice(&[0x25, 0x88, 4, 0]); // GPS IFD pointer, LONG
+        t.extend_from_slice(&1u32.to_le_bytes());
+        t.extend_from_slice(&38u32.to_le_bytes());
+        t.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+        assert_eq!(t.len(), 38);
+        // GPS IFD at 38: 1 entry, GPSLatitude, RATIONAL x3 at 56.
+        t.extend_from_slice(&1u16.to_le_bytes());
+        t.extend_from_slice(&[0x02, 0x00, 5, 0]);
+        t.extend_from_slice(&3u32.to_le_bytes());
+        t.extend_from_slice(&56u32.to_le_bytes());
+        t.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(t.len(), 56);
+        for v in [45u32, 1, 30, 1, 15, 1] {
+            t.extend_from_slice(&v.to_le_bytes());
+        }
+        t
+    }
+
+    #[test]
+    fn location_is_removed_and_the_rest_kept() {
+        let read = |t: &[u8]| exif::Reader::new().read_raw(t.to_vec()).unwrap();
+        let before = read(&exif_with_gps());
+        assert!(before.get_field(exif::Tag::GPSLatitude, exif::In::PRIMARY).is_some());
+        let stripped = without_location(exif_with_gps());
+        assert_eq!(stripped.len(), exif_with_gps().len());
+        let after = read(&stripped);
+        assert!(after.fields().all(|f| f.ifd_num != exif::In::PRIMARY || f.tag.context() != exif::Context::Gps), "GPS left");
+        assert!(after.get_field(exif::Tag::GPSLatitude, exif::In::PRIMARY).is_none());
+        assert!(after.get_field(exif::Tag::Make, exif::In::PRIMARY).is_some());
+        assert!(!stripped.windows(4).any(|w| w == 45u32.to_le_bytes()), "latitude value left in the block");
+        // Nothing to remove: unchanged.
+        assert_eq!(without_location(stripped.clone()), stripped);
+    }
+
+    #[test]
+    fn png_and_tiff_encode() {
+        let image = sample();
+        let png = encode_png(&image, Some(&exif_with_gps()), Some(b"fake icc profile"));
+        assert_eq!(&png[1..4], b"PNG");
+        assert!(png.windows(4).any(|w| w == b"eXIf") && png.windows(4).any(|w| w == b"iCCP"));
+        let tiff = encode_tiff(&image, None);
+        assert!(&tiff[0..2] == b"II" || &tiff[0..2] == b"MM");
+        assert_eq!(image::load_from_memory(&tiff).unwrap().width(), 4);
     }
 }

@@ -7,7 +7,16 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use crate::{asset_object::AssetObject, library::ORIGINAL, model::model, store, ui::editor};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    asset_object::AssetObject,
+    library::ORIGINAL,
+    model::model,
+    render::{Format, Output},
+    store,
+    ui::editor,
+};
 
 /// The photo an action is for, and where it's shown.
 #[derive(Clone)]
@@ -35,62 +44,206 @@ pub fn edit(target: &Target) {
     editor::open(&target.nav, &target.toasts, &target.object);
 }
 
-/// Export the original, or for an edited photo ask which version first.
+/// Sizes offered for export: label and longest side (`None` = full size).
+const SIZES: [(&str, Option<u32>); 4] =
+    [("Full Size", None), ("Large (2048 px)", Some(2048)), ("Medium (1280 px)", Some(1280)), ("Small (640 px)", Some(640))];
+/// JPEG qualities offered.
+const QUALITIES: [(&str, u8); 4] = [("Maximum", 100), ("High", 92), ("Medium", 80), ("Low", 65)];
+const FORMATS: [(&str, &str, Format); 3] = [
+    ("JPEG", "Smaller files, adjustable quality", Format::Jpeg),
+    ("PNG", "Lossless, larger files", Format::Png),
+    ("TIFF", "Lossless and uncompressed, without camera details", Format::Tiff),
+];
+
+/// What the export dialog remembers between exports.
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Choices {
+    /// Save the original file as stored in iCloud (when not exporting an edit).
+    original_file: bool,
+    output: Output,
+}
+
+/// Ask how to export (version, format, size, quality, location), then
+/// where. Videos are saved as they are.
 pub fn export(parent: &gtk::Widget, toasts: &adw::ToastOverlay, object: &AssetObject) {
-    if object.with(|a| a.edit.is_none()) {
-        return export_as(parent, toasts, object.clone(), false);
+    let (filename, is_video, edited) = object.with(|a| (a.filename.clone(), a.is_video(), a.edit.is_some()));
+    if is_video {
+        return choose_file(parent, toasts, object.clone(), "Export Video", filename, Job::OriginalFile);
     }
-    let dialog = adw::AlertDialog::builder()
-        .heading("Export Which Version?")
-        .body("The edited photo is saved as a full-resolution JPEG with the original's date, camera and location.")
-        .build();
-    dialog.add_responses(&[("cancel", "Cancel"), ("original", "Original"), ("edited", "Edited")]);
-    dialog.set_response_appearance("edited", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("edited"));
-    let (parent2, toasts, object) = (parent.clone(), toasts.clone(), object.clone());
-    dialog.connect_response(None, move |_, response| match response {
-        "edited" => export_as(&parent2, &toasts, object.clone(), true),
-        "original" => export_as(&parent2, &toasts, object.clone(), false),
-        _ => {}
+    let choices: Choices = model().setting("export").and_then(|v| serde_json::from_str(&v).ok()).unwrap_or(Choices {
+        original_file: true,
+        output: Output::default(),
+    });
+    let extension = std::path::Path::new(&filename).extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_default();
+
+    let version = adw::ComboRow::builder().title("Version").model(&gtk::StringList::new(&["Edited", "Original"])).build();
+    version.set_visible(edited);
+    let format = adw::ComboRow::builder().title("Format").build();
+    let size = adw::ComboRow::builder().title("Size").model(&gtk::StringList::new(&SIZES.map(|(l, _)| l))).build();
+    let quality = adw::ComboRow::builder().title("Quality").model(&gtk::StringList::new(&QUALITIES.map(|(l, _)| l))).build();
+    let location = adw::SwitchRow::builder().title("Include Location").active(choices.output.location).build();
+    size.set_selected(SIZES.iter().position(|(_, e)| *e == choices.output.long_edge).unwrap_or(0) as u32);
+    quality.set_selected(QUALITIES.iter().position(|(_, q)| *q == choices.output.quality).unwrap_or(1) as u32);
+
+    // The format list: the original file is a choice only for the original.
+    let formats_for = move |original: bool| -> Vec<Option<Format>> {
+        let mut list: Vec<Option<Format>> = if original { vec![None] } else { Vec::new() };
+        list.extend(FORMATS.iter().map(|(_, _, f)| Some(*f)));
+        list
+    };
+    let listed: Rc<std::cell::RefCell<Vec<Option<Format>>>> = Rc::default();
+    let original_label = format!("Original File ({extension})");
+    let fill_formats = {
+        let (format, listed) = (format.clone(), listed.clone());
+        move |original: bool, wanted: Option<Format>| {
+            let list = formats_for(original);
+            let labels: Vec<&str> = list
+                .iter()
+                .map(|f| match f {
+                    None => original_label.as_str(),
+                    Some(f) => FORMATS.iter().find(|(_, _, x)| x == f).map(|(l, _, _)| *l).unwrap_or(""),
+                })
+                .collect();
+            format.set_model(Some(&gtk::StringList::new(&labels)));
+            format.set_selected(list.iter().position(|f| *f == wanted).unwrap_or(0) as u32);
+            listed.replace(list);
+        }
+    };
+    let chosen_format = {
+        let (format, listed) = (format.clone(), listed.clone());
+        move || listed.borrow().get(format.selected() as usize).copied().flatten()
+    };
+    let editing = move |version: &adw::ComboRow| edited && version.selected() == 0;
+    fill_formats(!editing(&version), if choices.original_file && !editing(&version) { None } else { Some(choices.output.format) });
+
+    // Rows that don't apply to the chosen format are dimmed.
+    let update = {
+        let (format, size, quality, location, chosen_format) = (format.clone(), size.clone(), quality.clone(), location.clone(), chosen_format.clone());
+        Rc::new(move || {
+            let picked = chosen_format();
+            format.set_subtitle(match picked {
+                None => "Exactly as stored in iCloud",
+                Some(f) => FORMATS.iter().find(|(_, _, x)| *x == f).map(|(_, d, _)| *d).unwrap_or(""),
+            });
+            size.set_sensitive(picked.is_some());
+            quality.set_sensitive(picked == Some(Format::Jpeg));
+            location.set_sensitive(picked.is_some_and(|f| f != Format::Tiff));
+            location.set_subtitle(match picked {
+                None => "Kept as in the original file",
+                Some(Format::Tiff) => "TIFF exports carry no camera details",
+                Some(_) => "The GPS position in the photo's details",
+            });
+        })
+    };
+    update();
+    let u = update.clone();
+    format.connect_selected_notify(move |_| u());
+    let (u, fill) = (update.clone(), Rc::new(fill_formats));
+    let chosen = chosen_format.clone();
+    version.connect_selected_notify(move |version| {
+        let keep = chosen().or(Some(Format::Jpeg));
+        fill(!editing(version), keep);
+        u();
+    });
+
+    let group = adw::PreferencesGroup::new();
+    group.add(&version);
+    group.add(&format);
+    let output_group = adw::PreferencesGroup::new();
+    output_group.add(&size);
+    output_group.add(&quality);
+    output_group.add(&location);
+    let page = adw::PreferencesPage::new();
+    page.add(&group);
+    page.add(&output_group);
+
+    let cancel = gtk::Button::with_label("Cancel");
+    let go = gtk::Button::with_label("Export…");
+    go.add_css_class("suggested-action");
+    let header = adw::HeaderBar::builder().show_start_title_buttons(false).show_end_title_buttons(false).build();
+    header.pack_start(&cancel);
+    header.pack_end(&go);
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(&header);
+    view.set_content(Some(&page));
+    let dialog = adw::Dialog::builder().title("Export Photo").content_width(440).child(&view).build();
+
+    let d = dialog.clone();
+    cancel.connect_clicked(move |_| {
+        d.close();
+    });
+    let (d, parent2, toasts, object) = (dialog.clone(), parent.clone(), toasts.clone(), object.clone());
+    go.connect_clicked(move |_| {
+        let picked = chosen_format();
+        let edit_version = editing(&version);
+        let mut choices = choices;
+        choices.original_file = picked.is_none();
+        if let Some(f) = picked {
+            choices.output.format = f;
+        }
+        choices.output.long_edge = SIZES[size.selected() as usize % SIZES.len()].1;
+        choices.output.quality = QUALITIES[quality.selected() as usize % QUALITIES.len()].1;
+        choices.output.location = location.is_active();
+        if let Ok(value) = serde_json::to_string(&choices) {
+            model().set_setting("export", &value);
+        }
+        d.close();
+        let stem = std::path::Path::new(&filename).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        match picked {
+            None => choose_file(&parent2, &toasts, object.clone(), "Export Original", filename.clone(), Job::OriginalFile),
+            Some(f) => {
+                let name = format!("{stem}{}.{}", if edit_version { " (Edited)" } else { "" }, f.extension());
+                let job = Job::Render { edited: edit_version, output: choices.output };
+                choose_file(&parent2, &toasts, object.clone(), if edit_version { "Export Edited Photo" } else { "Export Photo" }, name, job);
+            }
+        }
     });
     dialog.present(Some(parent));
 }
 
-fn export_as(parent: &gtk::Widget, toasts: &adw::ToastOverlay, object: AssetObject, edited: bool) {
-    let filename = object.with(|a| a.filename.clone());
-    let name = if edited {
-        let stem = std::path::Path::new(&filename).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        format!("{stem} (Edited).jpg")
-    } else {
-        filename
-    };
-    let dialog = gtk::FileDialog::builder()
-        .title(if edited { "Export Edited Photo" } else { "Export Original" })
-        .initial_name(name)
-        .accept_label("Export")
-        .build();
-    let root = parent.root().and_downcast::<gtk::Window>();
+/// What an export writes.
+#[derive(Clone, Copy)]
+enum Job {
+    /// The original file, byte for byte.
+    OriginalFile,
+    /// Rendered from the original, edited or not.
+    Render { edited: bool, output: Output },
+}
+
+/// Ask where to save, then write it. Test runs (CLOUDPHOTOS_EXPORT_DIR)
+/// skip the file chooser and write into that folder.
+fn choose_file(parent: &gtk::Widget, toasts: &adw::ToastOverlay, object: AssetObject, title: &str, name: String, job: Job) {
     let toasts = toasts.clone();
-    dialog.save(root.as_ref(), gio::Cancellable::NONE, move |result| {
-        let Ok(file) = result else { return };
-        let Some(path) = file.path() else { return };
+    let write = move |path: std::path::PathBuf| {
         glib::spawn_future_local(async move {
-            if edited {
-                toast(&toasts, "Exporting…");
-                match model().render_edited(&object, path).await {
+            match job {
+                Job::Render { edited, output } => {
+                    toast(&toasts, "Exporting…");
+                    match model().render(&object, edited, output, path).await {
+                        Ok(_) => toast(&toasts, "Exported."),
+                        Err(e) => toast(&toasts, &format!("Export failed: {e}")),
+                    }
+                }
+                Job::OriginalFile => match model().store.copy_out(&object.id(), ORIGINAL, path).await {
                     Ok(_) => toast(&toasts, "Exported."),
-                    Err(e) => toast(&toasts, &format!("Export failed: {e}")),
-                }
-                return;
-            }
-            match model().store.copy_out(&object.id(), ORIGINAL, path).await {
-                Ok(_) => toast(&toasts, "Exported."),
-                Err(store::Error::Missing) => {
-                    toast(&toasts, "The original hasn't been downloaded yet; try again once the sync reaches it.")
-                }
-                Err(e) => toast(&toasts, &format!("Export failed: {e:?}")),
+                    Err(store::Error::Missing) => {
+                        toast(&toasts, "The original hasn't been downloaded yet; try again once the sync reaches it.")
+                    }
+                    Err(e) => toast(&toasts, &format!("Export failed: {e:?}")),
+                },
             }
         });
+    };
+    if let Some(dir) = std::env::var_os("CLOUDPHOTOS_EXPORT_DIR") {
+        return write(std::path::PathBuf::from(dir).join(name));
+    }
+    let dialog = gtk::FileDialog::builder().title(title).initial_name(name).accept_label("Export").build();
+    let root = parent.root().and_downcast::<gtk::Window>();
+    dialog.save(root.as_ref(), gio::Cancellable::NONE, move |result| {
+        if let Some(path) = result.ok().and_then(|file| file.path()) {
+            write(path);
+        }
     });
 }
 

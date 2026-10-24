@@ -502,8 +502,28 @@ impl Model {
 
     /// The edited photo at full resolution as a JPEG, written to `target`.
     pub async fn render_edited(self: &Rc<Self>, object: &AssetObject, target: std::path::PathBuf) -> Result<std::path::PathBuf, String> {
-        let recipe = object.with(|a| a.edit).unwrap_or_default();
-        render::render_full(&self.store, &temp_dir(), &self.library_path(), &object.id(), recipe, target).await
+        self.render(object, true, render::Output::default(), target).await
+    }
+
+    /// Write the photo (its edit, or the original's pixels) as `output` says.
+    pub async fn render(
+        self: &Rc<Self>,
+        object: &AssetObject,
+        edited: bool,
+        output: render::Output,
+        target: std::path::PathBuf,
+    ) -> Result<std::path::PathBuf, String> {
+        let recipe = if edited { Some(object.with(|a| a.edit).unwrap_or_default()) } else { None };
+        render::render_full(&self.store, &temp_dir(), &self.library_path(), &object.id(), recipe, output, target).await
+    }
+
+    /// A remembered UI choice (stored in the library's meta table).
+    pub fn setting(&self, key: &str) -> Option<String> {
+        self.library.borrow().meta(&format!("ui.{key}"))
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) {
+        self.library.borrow().set_meta(&format!("ui.{key}"), value);
     }
 
     /// Upload the edited photo to iCloud as a new photo next to the original.

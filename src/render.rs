@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use gtk::{gio, glib};
 use image::RgbaImage;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     edit::{self, Recipe},
@@ -58,17 +59,78 @@ pub async fn store_display_images(store: &Store, temp: &Path, library_path: &Pat
     .await
 }
 
-/// A full-resolution JPEG of the edited photo, carrying the original's
-/// EXIF (date, camera, location), written to `target`.
-pub async fn render_full(store: &Store, temp: &Path, library_path: &Path, id: &str, recipe: Recipe, target: PathBuf) -> Result<PathBuf, String> {
+/// File formats a photo can be exported in (besides the original file).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Format {
+    Jpeg,
+    Png,
+    Tiff,
+}
+
+impl Format {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Format::Jpeg => "jpg",
+            Format::Png => "png",
+            Format::Tiff => "tif",
+        }
+    }
+}
+
+/// How to write a rendered photo.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Output {
+    pub format: Format,
+    /// Longest side in pixels; `None` = full size.
+    pub long_edge: Option<u32>,
+    /// JPEG quality, 1–100.
+    pub quality: u8,
+    /// Keep the GPS position in the EXIF.
+    pub location: bool,
+}
+
+impl Default for Output {
+    fn default() -> Self {
+        Self { format: Format::Jpeg, long_edge: None, quality: 92, location: true }
+    }
+}
+
+/// The photo rendered from its full-resolution original — with `recipe`
+/// applied when given — written to `target` as `output` says, carrying the
+/// original's EXIF (date, camera, and location unless left out) and ICC
+/// color profile.
+pub async fn render_full(
+    store: &Store,
+    temp: &Path,
+    library_path: &Path,
+    id: &str,
+    recipe: Option<Recipe>,
+    output: Output,
+    target: PathBuf,
+) -> Result<PathBuf, String> {
     let (pixels, icc) = decode_original(store, temp, id).await?;
     let (library_path, id) = (library_path.to_owned(), id.to_owned());
     off_thread(move || -> Result<PathBuf, String> {
-        let exif = library::connect(&library_path).ok().and_then(|db| edit::original_exif(&db, &id));
+        let exif = library::connect(&library_path)
+            .ok()
+            .and_then(|db| edit::original_exif(&db, &id))
+            .map(|tiff| if output.location { tiff } else { edit::without_location(tiff) });
         let gamut = edit::Gamut::from_icc(icc.as_deref());
-        let jpeg = edit::encode_jpeg(&recipe.apply(pixels, gamut), 92, exif.as_deref(), icc.as_deref());
+        let image = match recipe {
+            Some(recipe) => recipe.apply(pixels, gamut),
+            None => pixels,
+        };
+        let image = match output.long_edge {
+            Some(edge) => edit::fit(&image, edge),
+            None => image,
+        };
+        let bytes = match output.format {
+            Format::Jpeg => edit::encode_jpeg(&image, output.quality.clamp(1, 100), exif.as_deref(), icc.as_deref()),
+            Format::Png => edit::encode_png(&image, exif.as_deref(), icc.as_deref()),
+            Format::Tiff => edit::encode_tiff(&image, icc.as_deref()),
+        };
         let part = target.with_extension("part");
-        std::fs::write(&part, jpeg).map_err(|e| e.to_string())?;
+        std::fs::write(&part, bytes).map_err(|e| e.to_string())?;
         std::fs::rename(&part, &target).map_err(|e| e.to_string())?;
         Ok(target)
     })

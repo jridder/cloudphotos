@@ -59,6 +59,20 @@ pub fn run(window: adw::ApplicationWindow) {
                         menu.popdown();
                     }
                 }
+                "combo" => {
+                    // combo TITLE N: choose item N of the dropdown row TITLE.
+                    let (title, n) = arg.rsplit_once(' ').unwrap_or((arg, "0"));
+                    if let Some(row) = find_titled::<adw::ComboRow>(window.upcast_ref(), title) {
+                        row.set_selected(n.parse().unwrap_or(0));
+                    }
+                }
+                "switch" => {
+                    // switch TITLE on|off
+                    let (title, state) = arg.rsplit_once(' ').unwrap_or((arg, "on"));
+                    if let Some(row) = find_titled::<adw::SwitchRow>(window.upcast_ref(), title) {
+                        row.set_active(state == "on");
+                    }
+                }
                 "respond" => {
                     // respond ID: answer the open alert dialog (e.g. "respond delete").
                     if let Some(dialog) = find::<adw::AlertDialog>(window.upcast_ref()) {
@@ -74,7 +88,10 @@ pub fn run(window: adw::ApplicationWindow) {
                 }
                 "click" => {
                     // click TOOLTIP: press the visible button with that tooltip.
-                    if let Some(button) = find_button(window.upcast_ref(), arg) {
+                    // An open dialog is modal: look there first.
+                    let dialog = find::<adw::Dialog>(window.upcast_ref());
+                    let button = dialog.and_then(|d| find_button(d.upcast_ref(), arg)).or_else(|| find_button(window.upcast_ref(), arg));
+                    if let Some(button) = button {
                         button.emit_clicked();
                     }
                 }
@@ -208,6 +225,21 @@ fn find_slider(root: &gtk::Widget, name: &str) -> Option<gtk::Scale> {
                     found = Some(scale);
                     return true;
                 }
+            }
+        }
+        false
+    });
+    found
+}
+
+/// The mapped preferences row of type T titled `title`.
+fn find_titled<T: IsA<gtk::Widget> + IsA<adw::PreferencesRow>>(root: &gtk::Widget, title: &str) -> Option<T> {
+    let mut found = None;
+    walk(root, &mut |w| {
+        if let Some(row) = w.downcast_ref::<T>() {
+            if w.is_mapped() && row.title() == title {
+                found = Some(row.clone());
+                return true;
             }
         }
         false
