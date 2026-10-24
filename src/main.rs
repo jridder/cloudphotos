@@ -23,6 +23,14 @@ thread_local! {
 }
 
 fn main() -> glib::ExitCode {
+    // Video frames from GStreamer are GL textures. GTK's Vulkan renderer has
+    // to download them through a GL context, and on NVIDIA that context can
+    // fail to become current, which aborts the app (epoxy "Couldn't find
+    // current GLX or EGL context"). The GL renderer draws them directly.
+    if std::env::var_os("GSK_RENDERER").is_none() {
+        // SAFETY: first thing in main, before GTK or any other thread starts.
+        unsafe { std::env::set_var("GSK_RENDERER", "gl") };
+    }
     glib::set_application_name("Cloud Photos");
     let mut flags = gio::ApplicationFlags::empty();
     // Fake-library runs (tests, screenshots) are their own instance.
