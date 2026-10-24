@@ -65,6 +65,13 @@ pub fn run(window: adw::ApplicationWindow) {
                         eprintln!("CLOUDPHOTOS_SCRIPT: edit = {:?}", o.with(|a| a.edit));
                     }
                 }
+                "slider" => {
+                    // slider NAME VALUE: set the editor slider under that label.
+                    let (name, value) = arg.rsplit_once(' ').unwrap_or((arg, "0"));
+                    if let Some(scale) = find_slider(window.upcast_ref(), name) {
+                        scale.set_value(value.parse().unwrap_or(0.0));
+                    }
+                }
                 "quit" => {
                     if let Some(app) = window.application() {
                         app.quit();
@@ -137,6 +144,23 @@ fn find_button(root: &gtk::Widget, tooltip: &str) -> Option<gtk::Button> {
             if button.is_mapped() && (button.tooltip_text().as_deref() == Some(tooltip) || button.label().as_deref() == Some(tooltip)) {
                 found = Some(button.clone());
                 return true;
+            }
+        }
+        false
+    });
+    found
+}
+
+/// The gtk::Scale that follows the label `name` (editor sliders).
+fn find_slider(root: &gtk::Widget, name: &str) -> Option<gtk::Scale> {
+    let mut found = None;
+    walk(root, &mut |w| {
+        if let Some(label) = w.downcast_ref::<gtk::Label>() {
+            if label.is_mapped() && label.label() == name {
+                if let Some(scale) = label.parent().and_then(|row| row.next_sibling()).and_downcast::<gtk::Scale>() {
+                    found = Some(scale);
+                    return true;
+                }
             }
         }
         false

@@ -14,7 +14,8 @@ gtk = { package = "gtk4", version = "0.11", features = ["v4_20"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
 async-channel = "2"
 glycin = { version = "4", features = ["gdk4"] }
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "rayon"] }
+rayon = "1"
 kamadak-exif = "0.6"
 rusqlite = { version = "0.37", features = ["bundled", "blob"] }
 serde = { version = "1", features = ["derive"] }

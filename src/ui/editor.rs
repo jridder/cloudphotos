@@ -1,13 +1,17 @@
 //! The edit page: rotate, flip and crop one photo.
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::Arc,
+};
 
 use adw::prelude::*;
 use gtk::glib;
 
 use crate::{
     asset_object::AssetObject,
-    edit::Recipe,
+    edit::{self, Adjustments, Recipe},
     library::PREVIEW,
     model::model,
     ui::crop::CropCanvas,
@@ -67,6 +71,70 @@ impl History {
     fn update(&self) {
         self.undo_button.set_sensitive(!self.undo.borrow().is_empty());
         self.redo_button.set_sensitive(!self.redo.borrow().is_empty());
+    }
+}
+
+/// Sliders: label, range, step, and the field they set. Exposure is in
+/// stops; the rest show -100..100.
+type Field = fn(&mut Adjustments) -> &mut f32;
+const LIGHT: [(&str, f64, f64, Field); 4] = [
+    ("Exposure", -3.0, 3.0, |a| &mut a.exposure),
+    ("Contrast", -1.0, 1.0, |a| &mut a.contrast),
+    ("Highlights", -1.0, 1.0, |a| &mut a.highlights),
+    ("Shadows", -1.0, 1.0, |a| &mut a.shadows),
+];
+const COLOR: [(&str, f64, f64, Field); 4] = [
+    ("Saturation", -1.0, 1.0, |a| &mut a.saturation),
+    ("Vibrance", -1.0, 1.0, |a| &mut a.vibrance),
+    ("Warmth", -1.0, 1.0, |a| &mut a.warmth),
+    ("Tint", -1.0, 1.0, |a| &mut a.tint),
+];
+
+fn slider_value_label(name: &str, v: f64) -> String {
+    if name == "Exposure" { format!("{v:+.2}") } else { format!("{:+.0}", v * 100.0) }
+}
+
+/// Live color preview: the editor's picture with the current adjustments,
+/// rendered off the main thread from a downscaled copy (latest wins).
+struct ColorPreview {
+    canvas: CropCanvas,
+    base: RefCell<Option<Arc<image::RgbaImage>>>,
+    shown: Cell<Option<Adjustments>>,
+    busy: Cell<bool>,
+    pending: Cell<Option<Adjustments>>,
+}
+
+impl ColorPreview {
+    fn request(self: &Rc<Self>, adjust: Adjustments) {
+        if self.shown.get() == Some(adjust) && !self.busy.get() {
+            return;
+        }
+        if self.busy.get() {
+            self.pending.set(Some(adjust));
+            return;
+        }
+        let Some(base) = self.base.borrow().clone() else { return };
+        self.busy.set(true);
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            let (tx, rx) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                let mut image = (*base).clone();
+                edit::apply_color(&mut image, &adjust, edit::Gamut::Srgb);
+                let (w, h) = image.dimensions();
+                let _ = tx.send_blocking((w, h, image.into_raw()));
+            });
+            if let Ok((w, h, data)) = rx.recv().await {
+                let bytes = glib::Bytes::from_owned(data);
+                let texture = gtk::gdk::MemoryTexture::new(w as i32, h as i32, gtk::gdk::MemoryFormat::R8g8b8a8, &bytes, w as usize * 4);
+                this.canvas.set_texture(Some(texture.upcast_ref()));
+                this.shown.set(Some(adjust));
+            }
+            this.busy.set(false);
+            if let Some(next) = this.pending.take() {
+                this.request(next);
+            }
+        });
     }
 }
 
@@ -131,6 +199,36 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, object: &Asse
     }
     shapes[0].set_active(true);
 
+    // Light and Color: one slider per adjustment, double-click to reset.
+    let mut sliders: Vec<(gtk::Scale, gtk::Label, &'static str, Field)> = Vec::new();
+    let mut slider_group = |title: &str, specs: &[(&'static str, f64, f64, Field)]| {
+        let group = adw::PreferencesGroup::builder().title(title).build();
+        let list = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
+        list.add_css_class("card");
+        for (name, min, max, field) in specs {
+            let title_label = gtk::Label::builder().label(*name).xalign(0.0).hexpand(true).build();
+            let value = gtk::Label::builder().label(slider_value_label(name, 0.0)).build();
+            value.add_css_class("dimmed");
+            value.add_css_class("numeric");
+            let top = gtk::Box::builder().spacing(6).margin_start(12).margin_end(12).margin_top(8).build();
+            top.append(&title_label);
+            top.append(&value);
+            let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, *min, *max, (max - min) / 200.0);
+            scale.set_value(0.0);
+            scale.add_mark(0.0, gtk::PositionType::Bottom, None);
+            scale.set_margin_start(6);
+            scale.set_margin_end(6);
+            scale.set_tooltip_text(Some("Double-click to reset"));
+            list.append(&top);
+            list.append(&scale);
+            sliders.push((scale, value, name, *field));
+        }
+        group.add(&list);
+        group
+    };
+    let light_group = slider_group("Light", &LIGHT);
+    let color_group = slider_group("Color", &COLOR);
+
     let reset = gtk::Button::builder().label("Reset All").halign(gtk::Align::Center).build();
     reset.add_css_class("pill");
 
@@ -145,6 +243,8 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, object: &Asse
     panel_box.append(&rotate_group);
     panel_box.append(&flip_group);
     panel_box.append(&crop_group);
+    panel_box.append(&light_group);
+    panel_box.append(&color_group);
     panel_box.append(&reset);
     let panel = gtk::ScrolledWindow::builder()
         .child(&panel_box)
@@ -165,12 +265,29 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, object: &Asse
     view.set_content(Some(&body));
     let page = adw::NavigationPage::builder().title("Edit").tag("editor").child(&view).build();
 
-    // The unedited preview; the recipe is drawn on top of it live.
+    // The unedited preview; geometry is drawn on top of it live, and color
+    // adjustments re-render a downscaled copy in the background.
+    let preview = Rc::new(ColorPreview {
+        canvas: canvas.clone(),
+        base: RefCell::default(),
+        shown: Cell::new(None),
+        busy: Cell::new(false),
+        pending: Cell::new(None),
+    });
     let id = object.id();
-    let c = canvas.clone();
+    let (c, p) = (canvas.clone(), preview.clone());
     glib::spawn_future_local(async move {
-        if let Ok(texture) = model().store.texture(&id, PREVIEW).await {
-            c.set_texture(Some(&texture));
+        let Ok(texture) = model().store.texture(&id, PREVIEW).await else { return };
+        c.set_texture(Some(&texture));
+        let (tx, rx) = async_channel::bounded(1);
+        let pixels = edit::texture_pixels(&texture);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(edit::fit(&pixels, 1600));
+        });
+        if let Ok(base) = rx.recv().await {
+            p.base.replace(Some(Arc::new(base)));
+            p.shown.set(Some(Adjustments::default()));
+            p.request(c.recipe().color);
         }
     });
 
@@ -191,6 +308,66 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, object: &Asse
             h.record(before);
         }
     });
+    // Sliders <-> recipe. A burst of slider movement is one undo step,
+    // recorded once it settles; undo/redo/reset move the sliders back.
+    let syncing = Rc::new(Cell::new(false));
+    let settle: Rc<RefCell<Option<(Recipe, glib::SourceId)>>> = Rc::default();
+    let sliders = Rc::new(sliders);
+    for (scale, value, name, field) in sliders.iter() {
+        let (c, h, syncing, settle, value, name, field) =
+            (canvas.clone(), history.clone(), syncing.clone(), settle.clone(), value.clone(), *name, *field);
+        scale.connect_value_changed(move |scale| {
+            value.set_label(&slider_value_label(name, scale.value()));
+            if syncing.get() {
+                return;
+            }
+            let before = c.recipe();
+            let mut recipe = before;
+            *field(&mut recipe.color) = scale.value() as f32;
+            let first = match settle.borrow_mut().take() {
+                Some((first, timer)) => {
+                    timer.remove();
+                    first
+                }
+                None => before,
+            };
+            let (h2, settle2) = (h.clone(), settle.clone());
+            let timer = glib::timeout_add_local_once(std::time::Duration::from_millis(700), move || {
+                if let Some((first, _)) = settle2.borrow_mut().take() {
+                    h2.record(first);
+                }
+            });
+            settle.borrow_mut().replace((first, timer));
+            c.set_recipe(recipe);
+        });
+        let reset_one = gtk::GestureClick::new();
+        let s = scale.clone();
+        reset_one.connect_pressed(move |_, n, _, _| {
+            if n == 2 {
+                s.set_value(0.0);
+            }
+        });
+        scale.add_controller(reset_one);
+    }
+    let (p, sl, syncing2) = (preview.clone(), sliders.clone(), syncing.clone());
+    let weak_canvas = canvas.downgrade();
+    canvas.connect_changed(move || {
+        let Some(c) = weak_canvas.upgrade() else { return };
+        let mut color = c.recipe().color;
+        p.request(color);
+        syncing2.set(true);
+        for (scale, _, _, field) in sl.iter() {
+            let v = *field(&mut color) as f64;
+            if (scale.value() - v).abs() > 1e-6 {
+                scale.set_value(v);
+            }
+        }
+        syncing2.set(false);
+    });
+
+    // Show the saved edit's values on the sliders.
+    canvas.set_recipe(canvas.recipe());
+
     let shortcuts = gtk::ShortcutController::new();
     for (trigger, redo) in [("<Control>z", false), ("<Control><Shift>z", true), ("<Control>y", true)] {
         let h = history.clone();
