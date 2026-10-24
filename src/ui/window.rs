@@ -64,6 +64,9 @@ pub struct Window {
     title: adw::WindowTitle,
     spinner: adw::Spinner,
     refresh: gtk::Button,
+    sync_box: gtk::Box,
+    sync_label: gtk::Label,
+    sync_bar: gtk::ProgressBar,
     current: RefCell<Collection>,
     items: RefCell<Option<gio::ListModel>>,
 }
@@ -82,6 +85,23 @@ pub fn build(app: &adw::Application) -> Rc<Window> {
     let sidebar_view = adw::ToolbarView::new();
     sidebar_view.add_top_bar(&adw::HeaderBar::new());
     sidebar_view.set_content(Some(&gtk::ScrolledWindow::builder().child(&sidebar).vexpand(true).build()));
+    // Offline download progress, at the foot of the sidebar.
+    let sync_label = gtk::Label::builder().xalign(0.0).wrap(true).build();
+    sync_label.add_css_class("caption");
+    sync_label.add_css_class("dimmed");
+    let sync_bar = gtk::ProgressBar::new();
+    let sync_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(6)
+        .margin_bottom(12)
+        .visible(false)
+        .build();
+    sync_box.append(&sync_label);
+    sync_box.append(&sync_bar);
+    sidebar_view.add_bottom_bar(&sync_box);
     let sidebar_page = adw::NavigationPage::builder().title("Cloud Photos").child(&sidebar_view).build();
 
     // Content: grid or a status page, under a header with the collection name.
@@ -134,6 +154,9 @@ pub fn build(app: &adw::Application) -> Rc<Window> {
         title,
         spinner,
         refresh,
+        sync_box,
+        sync_label,
+        sync_bar,
         current: RefCell::new(Collection::Library),
         items: RefCell::default(),
     });
@@ -156,10 +179,12 @@ pub fn build(app: &adw::Application) -> Rc<Window> {
             Event::State => win.update_state(),
             Event::Scanning(count) => win.update_scanning(*count),
             Event::Albums => win.rebuild_sidebar(),
+            Event::Syncing(progress) => win.update_sync(*progress),
             Event::Toast(message) => win.toast(message),
         }
     });
     win.rebuild_sidebar();
+    win.update_sync(None);
     win.show(Collection::Library);
     win.update_state();
     win
@@ -278,6 +303,30 @@ impl Window {
             }
         } else {
             self.update_state();
+        }
+    }
+}
+
+impl Window {
+    fn update_sync(&self, progress: Option<(usize, usize, u64)>) {
+        self.sync_box.set_visible(true);
+        self.sync_bar.set_visible(progress.is_some());
+        if progress.is_none() {
+            // Idle: what the library holds, and where.
+            let model = model();
+            let ((files, bytes), (wanted, _)) = model.totals();
+            let path = model.library_path();
+            let folder = path.parent().map(|p| p.to_string_lossy().replace(&*glib::home_dir().to_string_lossy(), "~")).unwrap_or_default();
+            let complete = if files >= wanted { "All downloaded" } else { "Partly downloaded" };
+            self.sync_label.set_label(&format!("{complete} · {} on this computer\n{folder}", glib::format_size(bytes)));
+            self.sync_box.set_tooltip_text(Some(&path.to_string_lossy()));
+        }
+        if let Some((done, total, bytes)) = progress {
+            self.sync_label.set_label(&format!(
+                "Downloading your library · {done} of {total} files · {}",
+                glib::format_size(bytes)
+            ));
+            self.sync_bar.set_fraction(done as f64 / total.max(1) as f64);
         }
     }
 }

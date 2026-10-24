@@ -29,6 +29,7 @@ import sys
 import time
 
 SMART_ALBUMS = ("Favorites", "Screenshots", "Videos", "Live", "Panoramas", "Slo-mo", "Time-lapse", "Bursts")
+DELETED_ALBUM = "Recently Deleted"
 BATCH = 200
 
 
@@ -52,6 +53,8 @@ def resource_dict(resource):
         "width": resource.width,
         "height": resource.height,
         "type": resource.type,
+        # Apple's fingerprint of the file; changes when the photo is edited.
+        "checksum": resource.checksum,
     }
 
 
@@ -67,13 +70,14 @@ def asset_resources(asset):
     r = asset.resources
     movie = asset.item_type == "movie"
     out = {}
+    # What the local library keeps: JPEG thumb and preview for display, and
+    # the originals (a video's original is the movie; a Live Photo's motion
+    # part is its original video).
     for name, keys in (
         ("thumb", ("thumb_image",) if movie else ("thumb",)),
         ("preview", ("medium_image", "thumb_image") if movie else ("medium", "thumb")),
         ("original", ("original",)),
-        # Streamable video: the smaller rendition first.
-        ("video", ("medium", "original") if movie else ()),
-        ("live", () if movie else ("medium_video", "original_video")),
+        ("live", () if movie else ("original_video",)),
     ):
         res = pick(r, *keys)
         if res is not None:
@@ -96,6 +100,7 @@ def asset_dict(asset):
     width, height = asset.dimensions
     return {
         "id": asset.id,
+        "master": asset.master_id,
         "filename": asset.filename or "",
         "kind": "video" if asset.item_type == "movie" else "photo",
         "taken": taken.timestamp(),
@@ -175,9 +180,14 @@ class ICloudLibrary:
             emit({"event": "assets", "items": batch})
 
         albums = []
+        recently_deleted = []
         for album in photos.albums:
             kind = type(album).__name__
             if kind == "PhotoAlbumFolder":
+                continue
+            if kind == "SmartPhotoAlbum" and album.name == DELETED_ALBUM:
+                # Kept locally until Apple purges them; mirrored away after.
+                recently_deleted = [a.id for a in album]
                 continue
             if kind == "SmartPhotoAlbum":
                 if album.name not in SMART_ALBUMS:
@@ -188,7 +198,7 @@ class ICloudLibrary:
                 albums.append({"id": album.id, "name": album.fullname, "kind": "user",
                                "assets": [a.id for a in album]})
         emit({"event": "albums", "albums": albums})
-        return {"sync_token": token}
+        return {"sync_token": token, "recently_deleted": recently_deleted}
 
     def changed(self, params):
         since = params.get("since")
@@ -208,14 +218,43 @@ class ICloudLibrary:
         return asset
 
     def urls(self, params):
+        """Fresh download URLs for several items in one CloudKit request.
+
+        Looks the asset and master records up by name (records/lookup), which
+        answers in well under a second; pyicloud's per-photo get() runs an
+        index query that took ~55 s per item on a real library.
+        """
+        from pyicloud.common.cloudkit.models import CKRecord, CKZoneIDReq
+        from pyicloud.services.photos_cloudkit.constants import PRIMARY_ZONE
+        from pyicloud.services.photos_cloudkit.service import PhotoAsset
+
+        photos = self._photos()
+        ids = list(params.get("ids", []))
+        masters = dict(params.get("masters") or {})
+        lookup = photos.private_client.lookup
+
+        def fetch(names):
+            response = lookup(record_names=names, zone_id=CKZoneIDReq(**PRIMARY_ZONE))
+            return {r.recordName: r for r in response.records if isinstance(r, CKRecord)}
+
+        records = fetch(ids + [masters[i] for i in ids if masters.get(i)])
+        missing = [i for i in ids if not masters.get(i) and i in records]
+        for i in missing:
+            ref = records[i].fields.get_value("masterRef")
+            name = ref.get("recordName") if isinstance(ref, dict) else getattr(ref, "recordName", None)
+            if name:
+                masters[i] = name
+        if missing:
+            records.update(fetch([masters[i] for i in missing if masters.get(i)]))
+
         out = {}
-        for asset_id in params.get("ids", []):
-            # Fetch again: download URLs are short-lived.
-            asset = self._photos().all.get(asset_id)
-            if asset is None:
+        for i in ids:
+            asset_record, master_record = records.get(i), records.get(masters.get(i, ""))
+            if asset_record is None or master_record is None:
                 continue
-            self.assets[asset_id] = asset
-            out[asset_id] = {k: v["url"] for k, v in asset_resources(asset).items()}
+            asset = PhotoAsset(photos, master_record=master_record, asset_record=asset_record)
+            self.assets[i] = asset
+            out[i] = {k: v["url"] for k, v in asset_resources(asset).items()}
         return out
 
     def favorite(self, params):
@@ -253,16 +292,22 @@ class FakeLibrary:
             raise HelperError("needs_signin", "iCloud needs you to sign in again.")
         return {"apple_id": "someone@example.com"}
 
+    scans = 0
+
     def scan(self, params):
         self._record("scan", params)
-        library = self._library()
+        # "{scan}" in URLs becomes the scan number, so tests can expire old links.
+        FakeLibrary.scans += 1
+        with open(os.path.join(self.directory, "library.json"), encoding="utf-8") as handle:
+            library = json.loads(handle.read().replace("{scan}", str(FakeLibrary.scans)))
         items = library["assets"]
         delay = library.get("delay", 0)
         for start in range(0, len(items), BATCH):
             time.sleep(delay)
             emit({"event": "assets", "items": items[start:start + BATCH]})
         emit({"event": "albums", "albums": library.get("albums", [])})
-        return {"sync_token": library.get("sync_token", "fake-1")}
+        return {"sync_token": library.get("sync_token", "fake-1"),
+                "recently_deleted": library.get("recently_deleted", [])}
 
     def changed(self, params):
         self._record("changed", params)

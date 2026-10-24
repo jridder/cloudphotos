@@ -44,14 +44,14 @@ impl PhotoGrid {
             cell.set_tooltip_text(Some(&format!("{filename}\n{}", format_date(taken))));
 
             let model = model();
-            match model.images.cached(&object.id(), "thumb") {
+            match model.store.cached(&object.id(), crate::library::THUMB) {
                 Some(texture) => picture.set_paintable(Some(&texture)),
                 None => {
                     picture.set_paintable(None::<&gdk::Paintable>);
                     let item = item.downgrade();
                     let picture = picture.downgrade();
                     glib::spawn_future_local(async move {
-                        let texture = model.texture(&object, "thumb").await;
+                        let texture = model.texture(&object, crate::library::THUMB).await;
                         // The cell may have been recycled for another item meanwhile.
                         let (Some(item), Some(picture)) = (item.upgrade(), picture.upgrade()) else { return };
                         if item.item().as_ref() == Some(object.upcast_ref()) {

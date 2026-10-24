@@ -7,8 +7,9 @@ use gtk::{gdk, gio, glib};
 
 use crate::{
     asset_object::AssetObject,
-    images,
+    library::{LIVE, ORIGINAL, PREVIEW, THUMB},
     model::model,
+    store,
     ui::grid::format_date,
 };
 
@@ -242,7 +243,7 @@ impl Viewer {
         self.title.set_title(&asset.filename);
         self.title.set_subtitle(&format_date(asset.taken));
         self.page.set_title(&asset.filename);
-        self.live.set_visible(asset.live && asset.resources.contains_key("live"));
+        self.live.set_visible(asset.live && asset.resources.contains_key(LIVE));
         self.fill_info(&object);
         self.set_zoom(0.0);
         self.video.set_media_stream(None::<&gtk::MediaStream>);
@@ -253,37 +254,45 @@ impl Viewer {
         let generation = self.loading.get() + 1;
         self.loading.set(generation);
         let model = model();
-        self.picture.set_paintable(model.images.cached(&object.id(), "thumb").as_ref());
+        self.picture.set_paintable(model.store.cached(&object.id(), THUMB).as_ref());
         let this = self.clone();
         glib::spawn_future_local(async move {
             if this.picture.paintable().is_none() {
-                if let Some(texture) = model.texture(&object, "thumb").await {
+                if let Some(texture) = model.texture(&object, THUMB).await {
                     if this.loading.get() == generation {
                         this.picture.set_paintable(Some(&texture));
                     }
                 }
             }
-            if let Some(texture) = model.texture(&object, "preview").await {
+            if let Some(texture) = model.texture(&object, PREVIEW).await {
                 if this.loading.get() == generation {
                     this.picture.set_paintable(Some(&texture));
                 }
             }
             if object.with(|a| a.is_video()) && this.loading.get() == generation {
-                this.play(&object, "video", false).await;
+                this.play(&object, ORIGINAL, false).await;
             }
         });
     }
 
     async fn play(&self, object: &AssetObject, rendition: &str, live: bool) {
-        let Some(url) = model().fresh_url(object, rendition).await else {
-            self.toast("Couldn't load the video.");
-            return;
+        // Playback reads a temporary copy pulled out of the library.
+        let file = match model().store.playable(&object.id(), rendition).await {
+            Ok(path) => gio::File::for_path(path),
+            Err(store::Error::Missing) => {
+                self.toast("This video hasn't been downloaded yet — it will play once the sync reaches it.");
+                return;
+            }
+            Err(e) => {
+                self.toast(&format!("Couldn't play it: {e:?}"));
+                return;
+            }
         };
-        // The viewer may have moved on while the URL was fetched.
+        // The viewer may have moved on meanwhile.
         if self.object.borrow().as_ref() != Some(object) {
             return;
         }
-        let media = gtk::MediaFile::for_file(&gio::File::for_uri(&url));
+        let media = gtk::MediaFile::for_file(&file);
         if live {
             let stack = self.stack.clone();
             media.connect_ended_notify(move |m| {
@@ -311,7 +320,7 @@ impl Viewer {
         }
         let this = self.clone();
         glib::spawn_future_local(async move {
-            this.play(&object, "live", true).await;
+            this.play(&object, LIVE, true).await;
             this.live_pending.set(false);
         });
     }
@@ -396,22 +405,12 @@ impl Viewer {
             let Ok(file) = result else { return };
             let Some(path) = file.path() else { return };
             glib::spawn_future_local(async move {
-                this.toast("Exporting…");
-                let Some(url) = model().fresh_url(&object, "original").await else {
-                    this.toast("Couldn't get the original from iCloud.");
-                    return;
-                };
-                let (tx, rx) = async_channel::bounded(1);
-                std::thread::spawn(move || {
-                    let result = images::download(&url)
-                        .map_err(|e| format!("{e:?}"))
-                        .and_then(|bytes| std::fs::write(&path, bytes).map_err(|e| e.to_string()));
-                    let _ = tx.send_blocking(result);
-                });
-                match rx.recv().await {
-                    Ok(Ok(())) => this.toast("Exported."),
-                    Ok(Err(e)) => this.toast(&format!("Export failed: {e}")),
-                    Err(_) => {}
+                match model().store.copy_out(&object.id(), ORIGINAL, path).await {
+                    Ok(_) => this.toast("Exported."),
+                    Err(store::Error::Missing) => {
+                        this.toast("The original hasn't been downloaded yet; try again once the sync reaches it.")
+                    }
+                    Err(e) => this.toast(&format!("Export failed: {e:?}")),
                 }
             });
         });

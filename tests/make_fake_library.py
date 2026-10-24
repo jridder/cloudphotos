@@ -60,27 +60,29 @@ def main():
         jpeg(os.path.join(media, f"{base}-preview.jpg"), pw, ph, hue)
         jpeg(os.path.join(media, f"{base}-original.jpg"), pw * 2, ph * 2, hue)
         url = lambda name: "file://" + os.path.join(media, name)  # noqa: E731
+        def res(name, w, h, uti):
+            path = os.path.join(media, name)
+            return {"url": url(name), "size": os.path.getsize(path), "width": w, "height": h, "type": uti,
+                    "checksum": f"{base}-{name}"}
+
         resources = {
-            "thumb": {"url": url(f"{base}-thumb.jpg"), "size": 20000, "width": tw, "height": th, "type": "public.jpeg"},
-            "preview": {"url": url(f"{base}-preview.jpg"), "size": 200000, "width": pw, "height": ph, "type": "public.jpeg"},
-            "original": {"url": url(f"{base}-original.jpg"), "size": 3_000_000, "width": width, "height": height,
-                         "type": "public.jpeg"},
+            "thumb": res(f"{base}-thumb.jpg", tw, th, "public.jpeg"),
+            "preview": res(f"{base}-preview.jpg", pw, ph, "public.jpeg"),
+            "original": res("clip.mov", 1920, 1080, "com.apple.quicktime-movie") if kind == "video"
+            else res(f"{base}-original.jpg", pw * 2, ph * 2, "public.jpeg"),
         }
-        if kind == "video":
-            resources["video"] = {"url": "file://" + movie, "size": 4096, "width": 1920, "height": 1080,
-                                  "type": "com.apple.quicktime-movie"}
         if live:
-            resources["live"] = {"url": "file://" + movie, "size": 4096, "width": 1440, "height": 1080,
-                                 "type": "com.apple.quicktime-movie"}
+            resources["live"] = res("clip.mov", 1440, 1080, "com.apple.quicktime-movie")
         assets.append({
             "id": f"FAKE-{i:04d}",
+            "master": f"MASTER-{i:04d}",
             "filename": f"IMG_{1000 + i:04d}.{'MOV' if kind == 'video' else 'HEIC'}",
             "kind": kind,
             "taken": taken,
             "added": taken + 60,
             "width": width,
             "height": height,
-            "size": 3_000_000,
+            "size": resources["original"]["size"],
             "live": live,
             "favorite": rng.random() < 0.1,
             "resources": resources,

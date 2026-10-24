@@ -1,5 +1,5 @@
-//! App state: the library (from SQLite, refreshed through the helper), the
-//! image cache, and what the UI listens to.
+//! App state: the local library (SQLite), the sync with iCloud, and what
+//! the UI listens to.
 
 use std::{
     cell::{Cell, OnceCell, RefCell},
@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use crate::{
     asset_object::AssetObject,
     helper::{Helper, HelperError},
-    images::{ImageError, Images},
-    library::{Album, Asset, Library},
+    library::{self, Album, Asset, Library},
+    store::{self, Download, Store},
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,7 +24,7 @@ pub enum State {
     NeedsSetup(String),
     /// The shared session expired; sign in again in the iCloud Drive app.
     NeedsSignin(String),
-    /// Offline or the helper failed; cached items still show.
+    /// Offline or the helper failed; the local library still shows.
     Offline(String),
     Ready,
 }
@@ -32,22 +32,28 @@ pub enum State {
 #[derive(Debug, Clone)]
 pub enum Event {
     State,
-    /// Scan running (items seen so far) or finished.
+    /// Listing the library (items seen so far), or done.
     Scanning(Option<usize>),
     Albums,
+    /// Downloading into the library: (files done, files total, bytes done), or idle.
+    Syncing(Option<(usize, usize, u64)>),
     Toast(String),
 }
+
+/// Items whose links are fetched in one request, then downloaded.
+const BATCH: usize = 100;
 
 pub struct Model {
     helper: RefCell<Option<Rc<Helper>>>,
     library: RefCell<Library>,
-    pub images: Rc<Images>,
-    /// Every item, newest first.
+    pub store: Rc<Store>,
+    /// Every visible item, newest first.
     pub all: gio::ListStore,
     by_id: RefCell<HashMap<String, AssetObject>>,
     albums: RefCell<Vec<Album>>,
     state: RefCell<State>,
     scanning: Cell<bool>,
+    syncing: Cell<bool>,
     scan_assets: RefCell<Vec<Asset>>,
     scan_albums: RefCell<Vec<Album>>,
     listeners: RefCell<Vec<Rc<dyn Fn(&Event)>>>,
@@ -61,7 +67,7 @@ pub fn model() -> Rc<Model> {
     MODEL.with(|cell| cell.get_or_init(Model::new).clone())
 }
 
-fn data_dir() -> std::path::PathBuf {
+fn state_dir() -> std::path::PathBuf {
     let dir = std::env::var_os("CLOUDPHOTOS_DATA_DIR")
         .map(Into::into)
         .unwrap_or_else(|| glib::user_data_dir().join("cloudphotos"));
@@ -69,7 +75,7 @@ fn data_dir() -> std::path::PathBuf {
     dir
 }
 
-fn cache_dir() -> std::path::PathBuf {
+fn temp_dir() -> std::path::PathBuf {
     std::env::var_os("CLOUDPHOTOS_CACHE_DIR")
         .map(Into::into)
         .unwrap_or_else(|| glib::user_cache_dir().join("cloudphotos"))
@@ -77,16 +83,18 @@ fn cache_dir() -> std::path::PathBuf {
 
 impl Model {
     fn new() -> Rc<Self> {
-        let library = Library::open(&data_dir().join("library.sqlite3")).expect("library database");
+        let path = library::default_path();
+        let library = Library::open(&path).expect("photo library");
         Rc::new(Self {
             helper: RefCell::default(),
+            store: Store::new(path, temp_dir()),
             library: RefCell::new(library),
-            images: Images::new(cache_dir().join("images")),
             all: gio::ListStore::new::<AssetObject>(),
             by_id: RefCell::default(),
             albums: RefCell::default(),
             state: RefCell::new(State::Starting),
             scanning: Cell::new(false),
+            syncing: Cell::new(false),
             scan_assets: RefCell::default(),
             scan_albums: RefCell::default(),
             listeners: RefCell::default(),
@@ -121,13 +129,20 @@ impl Model {
         self.albums.borrow().clone()
     }
 
-    // ── startup and scanning ────────────────────────────────────────────────
+    pub fn library_path(&self) -> std::path::PathBuf {
+        self.library.borrow().path().to_owned()
+    }
 
-    /// Show the saved library, then connect and refresh it.
+    /// (files, bytes) stored and wanted.
+    pub fn totals(&self) -> ((u64, u64), (u64, u64)) {
+        self.library.borrow().totals()
+    }
+
+    // ── startup, scanning, syncing ──────────────────────────────────────────
+
+    /// Show the local library, then connect and bring it up to date.
     pub fn start(self: &Rc<Self>) {
-        let assets = self.library.borrow().assets();
-        let albums = self.library.borrow().albums();
-        self.install(assets, albums);
+        self.reload();
         let this = self.clone();
         glib::spawn_future_local(async move { this.connect().await });
     }
@@ -144,12 +159,12 @@ impl Model {
             Err(e) => return self.set_state(State::Offline(e.message)),
         };
         self.helper.replace(Some(helper.clone()));
-        let params = json!({"session_dir": data_dir().join("session")});
-        match helper.call("connect", params).await {
-            Ok(_) => self.set_state(State::Ready),
-            Err(e) => return self.set_state(state_for(e)),
+        let params = json!({"session_dir": state_dir().join("session")});
+        if let Err(e) = helper.call("connect", params).await {
+            return self.set_state(state_for(e));
         }
-        let since = self.library.borrow().sync_token();
+        self.set_state(State::Ready);
+        let since = self.library.borrow().meta("sync_token");
         let changed = match helper.call("changed", json!({"since": since})).await {
             Ok(v) => v.get("changed").and_then(Value::as_bool).unwrap_or(true),
             Err(_) => true,
@@ -157,16 +172,22 @@ impl Model {
         if changed || self.all.n_items() == 0 {
             self.scan().await;
         }
+        self.sync().await;
     }
 
+    /// Check iCloud for changes now (the refresh button).
     pub fn refresh(self: &Rc<Self>) {
         if self.scanning.get() || self.state() != State::Ready {
             return;
         }
         let this = self.clone();
-        glib::spawn_future_local(async move { this.scan().await });
+        glib::spawn_future_local(async move {
+            this.scan().await;
+            this.sync().await;
+        });
     }
 
+    /// List the whole library from iCloud and merge it into the local one.
     async fn scan(self: &Rc<Self>) {
         let Some(helper) = self.helper.borrow().clone() else { return };
         self.scanning.set(true);
@@ -177,17 +198,25 @@ impl Model {
         self.scanning.set(false);
         match result {
             Ok(value) => {
-                let mut assets = std::mem::take(&mut *self.scan_assets.borrow_mut());
+                let assets = std::mem::take(&mut *self.scan_assets.borrow_mut());
                 let albums = std::mem::take(&mut *self.scan_albums.borrow_mut());
-                assets.sort_by(|a, b| b.taken.total_cmp(&a.taken).then_with(|| a.id.cmp(&b.id)));
                 let token = value.get("sync_token").and_then(Value::as_str).unwrap_or_default();
-                if let Err(e) = self.library.borrow_mut().replace(&assets, &albums, token) {
-                    self.notify(Event::Toast(format!("Couldn't save the library: {e}")));
+                let trash: Vec<String> = value
+                    .get("recently_deleted")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let result = self.library.borrow_mut().apply_scan(&assets, &albums, &trash, token);
+                match result {
+                    Ok(diff) if diff.added + diff.updated + diff.deleted + diff.purged > 0 => {
+                        eprintln!("cloudphotos: scan {diff:?}");
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.notify(Event::Toast(format!("Couldn't update the library: {e}"))),
                 }
-                self.install(assets, albums);
+                self.reload();
             }
             Err(e) if matches!(e.code.as_str(), "needs_signin" | "not_connected") => self.set_state(state_for(e)),
-            Err(e) => self.notify(Event::Toast(format!("Couldn't refresh the library: {}", e.message))),
+            Err(e) => self.notify(Event::Toast(format!("Couldn't check iCloud: {}", e.message))),
         }
         self.notify(Event::Scanning(None));
     }
@@ -217,9 +246,12 @@ impl Model {
         }
     }
 
-    /// Replace the visible library, keeping existing objects so open views
-    /// and cells stay attached.
-    fn install(&self, assets: Vec<Asset>, albums: Vec<Album>) {
+    /// Show what the library holds, keeping existing objects so open views stay attached.
+    fn reload(&self) {
+        let (assets, albums) = {
+            let library = self.library.borrow();
+            (library.assets(), library.albums())
+        };
         let mut old = std::mem::take(&mut *self.by_id.borrow_mut());
         let objects: Vec<AssetObject> = assets
             .into_iter()
@@ -231,62 +263,136 @@ impl Model {
                 None => AssetObject::new(asset),
             })
             .collect();
+        for id in old.keys() {
+            self.store.forget(id);
+        }
         self.by_id.replace(objects.iter().map(|o| (o.id(), o.clone())).collect());
         self.all.splice(0, self.all.n_items(), &objects);
         self.albums.replace(albums);
         self.notify(Event::Albums);
     }
 
-    /// Items of one album, newest first (ids no longer in the library are skipped).
+    /// Download everything missing: thumbnails first, then previews, then
+    /// originals, newest first. Links are fetched per batch right before use,
+    /// so they never expire mid-download.
+    async fn sync(self: &Rc<Self>) {
+        if self.syncing.replace(true) {
+            return;
+        }
+        let missing = self.library.borrow().missing();
+        let total = missing.len();
+        let mut done = 0usize;
+        let mut bytes = 0u64;
+        let mut failed = 0usize;
+        // Consecutive renditions of one item (same phase) share a link request.
+        let mut by_item: Vec<(String, Vec<String>)> = Vec::new();
+        for (id, kind) in missing {
+            match by_item.last_mut() {
+                Some((last, kinds)) if *last == id => kinds.push(kind),
+                _ => by_item.push((id, vec![kind])),
+            }
+        }
+        if total > 0 {
+            self.notify(Event::Syncing(Some((0, total, 0))));
+        }
+        for batch in by_item.chunks(BATCH) {
+            if self.state() != State::Ready {
+                break;
+            }
+            let Some(helper) = self.helper.borrow().clone() else { break };
+            let ids: Vec<&str> = batch.iter().map(|(id, _)| id.as_str()).collect();
+            let masters: serde_json::Map<String, Value> = {
+                let by_id = self.by_id.borrow();
+                batch
+                    .iter()
+                    .filter_map(|(id, _)| by_id.get(id).and_then(|o| o.with(|a| a.master.clone())).map(|m| (id.clone(), Value::from(m))))
+                    .collect()
+            };
+            let urls = match helper.call("urls", json!({"ids": ids, "masters": masters})).await {
+                Ok(urls) => urls,
+                Err(e) if matches!(e.code.as_str(), "needs_signin" | "not_connected") => {
+                    self.set_state(state_for(e));
+                    break;
+                }
+                Err(e) => {
+                    self.notify(Event::Toast(format!("Couldn't reach iCloud: {}", e.message)));
+                    break;
+                }
+            };
+            let (reply, results) = async_channel::unbounded();
+            let mut queued = 0;
+            for (id, kinds) in batch {
+                let Some(object) = self.by_id.borrow().get(id).cloned() else { continue };
+                for kind in kinds {
+                    let Some(url) = urls.get(id).and_then(|u| u.get(kind)).and_then(Value::as_str) else {
+                        done += 1;
+                        failed += 1;
+                        continue;
+                    };
+                    let (checksum, size) =
+                        object.with(|a| a.resources.get(kind).map(|r| (r.checksum.clone(), r.size)).unwrap_or_default());
+                    let job = Download { id: id.clone(), kind: kind.clone(), url: url.into(), checksum, size, reply: reply.clone() };
+                    let _ = self.store.downloads.send(job).await;
+                    queued += 1;
+                }
+            }
+            drop(reply);
+            for _ in 0..queued {
+                let Ok((id, kind, result)) = results.recv().await else { break };
+                done += 1;
+                match result {
+                    Ok(()) => {
+                        bytes += self
+                            .by_id
+                            .borrow()
+                            .get(&id)
+                            .and_then(|o| o.with(|a| a.resources.get(&kind).and_then(|r| r.size)))
+                            .unwrap_or(0);
+                        self.store.saved(&id, &kind);
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("cloudphotos: download {id} {kind} failed: {e:?}");
+                    }
+                }
+                if done % 10 == 0 || done == total {
+                    self.notify(Event::Syncing(Some((done, total, bytes))));
+                }
+            }
+        }
+        self.syncing.set(false);
+        self.notify(Event::Syncing(None));
+        if failed > 0 {
+            self.notify(Event::Toast(format!("{failed} files couldn't be downloaded; they'll be tried again next time.")));
+        }
+    }
+
+    /// Items of one album, newest first (ids not in the library are skipped).
     pub fn album_items(&self, album_id: &str) -> gio::ListStore {
         let store = gio::ListStore::new::<AssetObject>();
         let albums = self.albums.borrow();
         if let Some(album) = albums.iter().find(|a| a.id == album_id) {
             let by_id = self.by_id.borrow();
             let mut objects: Vec<AssetObject> = album.assets.iter().filter_map(|id| by_id.get(id).cloned()).collect();
-            objects.sort_by(|a, b| {
-                let (ta, tb) = (a.with(|x| x.taken), b.with(|x| x.taken));
-                tb.total_cmp(&ta)
-            });
+            objects.sort_by(|a, b| b.with(|x| x.taken).total_cmp(&a.with(|x| x.taken)));
             store.extend_from_slice(&objects);
         }
         store
     }
 
-    // ── images ──────────────────────────────────────────────────────────────
+    // ── files ───────────────────────────────────────────────────────────────
 
-    /// A rendition ("thumb" or "preview"), refreshing an expired URL once.
-    pub async fn texture(self: &Rc<Self>, object: &AssetObject, rendition: &str) -> Option<gdk::Texture> {
+    /// A thumbnail or preview; waits for the sync if it isn't downloaded yet.
+    pub async fn texture(self: &Rc<Self>, object: &AssetObject, kind: &str) -> Option<gdk::Texture> {
         let id = object.id();
-        if let Some(texture) = self.images.cached(&id, rendition) {
-            return Some(texture);
-        }
-        let url = object.with(|a| a.resources.get(rendition).and_then(|r| r.url.clone()));
-        match self.images.get(&id, rendition, url.as_deref()).await {
+        match self.store.texture(&id, kind).await {
             Ok(texture) => Some(texture),
-            Err(ImageError::Expired) => {
-                let url = self.fresh_url(object, rendition).await?;
-                self.images.get(&id, rendition, Some(&url)).await.ok()
+            Err(store::Error::Missing) if self.syncing.get() || self.state() == State::Starting => {
+                self.store.wait_for(&id, kind).await;
+                self.store.texture(&id, kind).await.ok()
             }
-            Err(ImageError::Failed(_)) => None,
+            Err(_) => None,
         }
-    }
-
-    /// Ask iCloud for a current download URL for one rendition.
-    pub async fn fresh_url(self: &Rc<Self>, object: &AssetObject, rendition: &str) -> Option<String> {
-        let helper = self.helper.borrow().clone()?;
-        let id = object.id();
-        let urls = helper.call("urls", json!({"ids": [id]})).await.ok()?;
-        let urls = urls.get(&id)?.as_object()?.clone();
-        object.update(|asset| {
-            for (key, url) in &urls {
-                if let (Some(resource), Some(url)) = (asset.resources.get_mut(key), url.as_str()) {
-                    resource.url = Some(url.to_owned());
-                }
-            }
-        });
-        self.library.borrow().update(&object.asset());
-        urls.get(rendition).and_then(Value::as_str).map(str::to_owned)
     }
 
     // ── changes ─────────────────────────────────────────────────────────────
@@ -295,7 +401,7 @@ impl Model {
         let Some(helper) = self.helper.borrow().clone() else { return };
         object.update(|a| a.favorite = value);
         match helper.call("favorite", json!({"id": object.id(), "value": value})).await {
-            Ok(_) => self.library.borrow().update(&object.asset()),
+            Ok(_) => self.library.borrow().set_favorite(&object.id(), value),
             Err(e) => {
                 object.update(|a| a.favorite = !value);
                 self.notify(Event::Toast(format!("Couldn't change Favorite: {}", e.message)));
@@ -303,7 +409,8 @@ impl Model {
         }
     }
 
-    /// Move to Recently Deleted in iCloud and drop it from the app.
+    /// Move to Recently Deleted in iCloud; the local copy stays (hidden)
+    /// until iCloud purges it.
     pub async fn delete(self: &Rc<Self>, object: &AssetObject) -> bool {
         let Some(helper) = self.helper.borrow().clone() else { return false };
         let id = object.id();
@@ -311,8 +418,7 @@ impl Model {
             self.notify(Event::Toast(format!("Couldn't delete: {}", e.message)));
             return false;
         }
-        self.library.borrow().remove(&id);
-        self.images.forget(&id);
+        self.library.borrow().mark_deleted(&id);
         self.by_id.borrow_mut().remove(&id);
         if let Some(pos) = self.all.find(object) {
             self.all.remove(pos);
