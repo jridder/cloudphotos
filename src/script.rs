@@ -35,6 +35,13 @@ pub fn run(window: adw::ApplicationWindow) {
                         }
                     }
                 }
+                "respond" => {
+                    // respond ID: answer the open alert dialog (e.g. "respond delete").
+                    if let Some(dialog) = find::<adw::AlertDialog>(window.upcast_ref()) {
+                        dialog.emit_by_name::<()>("response", &[&arg]);
+                        dialog.close();
+                    }
+                }
                 "focus" => {
                     // focus TOOLTIP: focus that button, scrolling it into view.
                     if let Some(button) = find_button(window.upcast_ref(), arg) {

@@ -529,9 +529,13 @@ impl Model {
     // ── changes ─────────────────────────────────────────────────────────────
 
     pub async fn set_favorite(self: &Rc<Self>, object: &AssetObject, value: bool) {
-        let Some(helper) = self.helper.borrow().clone() else { return };
+        let Some(helper) = self.helper.borrow().clone() else {
+            self.notify(Event::Toast("Couldn't change Favorite: not connected to iCloud.".into()));
+            return;
+        };
         object.update(|a| a.favorite = value);
-        match helper.call("favorite", json!({"id": object.id(), "value": value})).await {
+        let master = object.with(|a| a.master.clone());
+        match helper.call("favorite", json!({"id": object.id(), "master": master, "value": value})).await {
             Ok(_) => self.library.borrow().set_favorite(&object.id(), value),
             Err(e) => {
                 object.update(|a| a.favorite = !value);
@@ -543,9 +547,13 @@ impl Model {
     /// Move to Recently Deleted in iCloud; the local copy stays (hidden)
     /// until iCloud purges it.
     pub async fn delete(self: &Rc<Self>, object: &AssetObject) -> bool {
-        let Some(helper) = self.helper.borrow().clone() else { return false };
+        let Some(helper) = self.helper.borrow().clone() else {
+            self.notify(Event::Toast("Couldn't delete: not connected to iCloud.".into()));
+            return false;
+        };
         let id = object.id();
-        if let Err(e) = helper.call("delete", json!({"id": id})).await {
+        let master = object.with(|a| a.master.clone());
+        if let Err(e) = helper.call("delete", json!({"id": id, "master": master})).await {
             self.notify(Event::Toast(format!("Couldn't delete: {}", e.message)));
             return false;
         }

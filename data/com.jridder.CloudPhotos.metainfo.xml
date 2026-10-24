@@ -33,6 +33,11 @@
     <display_length compare="ge">768</display_length>
   </requires>
   <releases>
+    <release version="0.1.1" date="2026-10-24">
+      <description>
+        <p>Deleting and favoriting respond right away: the photo's record is looked up directly instead of searching the whole library, which could take a minute or more with no feedback.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-10-24">
       <description>
         <p>First release.</p>

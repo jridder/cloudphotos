@@ -16,9 +16,9 @@ Methods:
   connect  {config, cookie_dir, session_dir}   -> {apple_id}
   scan     {}                                  -> {sync_token}; emits "assets" and "albums"
   changed  {since}                             -> {changed: bool}
-  urls     {ids: [...]}                        -> {id: {key: url}} with fresh download URLs
-  favorite {id, value}                         -> {}
-  delete   {id}                                -> {}   (moves to Recently Deleted)
+  urls     {ids: [...], masters: {id: master}} -> {id: {key: url}} with fresh download URLs
+  favorite {id, master, value}                 -> {}
+  delete   {id, master}                        -> {}   (moves to Recently Deleted)
   upload   {path}                              -> {asset}  (a new photo, e.g. an edited copy)
 
 `--fake DIR` serves DIR/library.json instead, for tests and screenshots.
@@ -164,7 +164,6 @@ def asset_dict(asset):
 class ICloudLibrary:
     def __init__(self):
         self.api = None
-        self.assets = {}
 
     def connect(self, params):
         import yaml
@@ -211,12 +210,10 @@ class ICloudLibrary:
         photos = self._photos()
         token = photos.sync_cursor()
         batch = []
-        self.assets = {}
         for asset in photos.all:
             item = asset_dict(asset)
             if item is None:
                 continue
-            self.assets[asset.id] = asset
             batch.append(item)
             if len(batch) >= BATCH:
                 emit({"event": "assets", "items": batch})
@@ -253,17 +250,16 @@ class ICloudLibrary:
             return {"changed": True}
         return {"changed": False}
 
-    def _asset(self, asset_id):
-        asset = self.assets.get(asset_id)
+    def _asset(self, asset_id, master=None):
+        """The current record for one item, for changing it: looked up fresh
+        so its change tag is up to date (a stale one makes iCloud refuse)."""
+        asset = self._lookup([asset_id], {asset_id: master} if master else {}).get(asset_id)
         if asset is None:
-            asset = self._photos().all.get(asset_id)
-            if asset is None:
-                raise HelperError("not_found", "That photo is no longer in your library.")
-            self.assets[asset_id] = asset
+            raise HelperError("not_found", "That photo is no longer in your library.")
         return asset
 
-    def urls(self, params):
-        """Fresh download URLs for several items in one CloudKit request.
+    def _lookup(self, ids, masters):
+        """PhotoAssets for several items in one CloudKit request.
 
         Looks the asset and master records up by name (records/lookup), which
         answers in well under a second; pyicloud's per-photo get() runs an
@@ -274,8 +270,8 @@ class ICloudLibrary:
         from pyicloud.services.photos_cloudkit.service import PhotoAsset
 
         photos = self._photos()
-        ids = list(params.get("ids", []))
-        masters = dict(params.get("masters") or {})
+        ids = list(ids)
+        masters = dict(masters or {})
         lookup = photos.private_client.lookup
 
         def fetch(names):
@@ -297,27 +293,28 @@ class ICloudLibrary:
             asset_record, master_record = records.get(i), records.get(masters.get(i, ""))
             if asset_record is None or master_record is None:
                 continue
-            asset = PhotoAsset(photos, master_record=master_record, asset_record=asset_record)
-            self.assets[i] = asset
-            out[i] = {k: v["url"] for k, v in asset_resources(asset).items()}
+            out[i] = PhotoAsset(photos, master_record=master_record, asset_record=asset_record)
         return out
 
+    def urls(self, params):
+        """Fresh download URLs for several items in one CloudKit request."""
+        assets = self._lookup(params.get("ids", []), params.get("masters"))
+        return {i: {k: v["url"] for k, v in asset_resources(asset).items()} for i, asset in assets.items()}
+
     def favorite(self, params):
-        if not self._asset(params["id"]).set_favorite(bool(params["value"])):
+        if not self._asset(params["id"], params.get("master")).set_favorite(bool(params["value"])):
             raise HelperError("failed", "iCloud didn't accept the change.")
         return {}
 
     def delete(self, params):
-        if not self._asset(params["id"]).delete():
+        if not self._asset(params["id"], params.get("master")).delete():
             raise HelperError("failed", "iCloud didn't accept the change.")
-        self.assets.pop(params["id"], None)
         return {}
 
     def upload(self, params):
         asset = self._photos().upload(params["path"])
         if asset is None:
             raise HelperError("failed", "iCloud didn't accept the upload.")
-        self.assets[asset.id] = asset
         return {"asset": asset_dict(asset)}
 
 
