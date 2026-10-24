@@ -52,6 +52,19 @@ pub fn run(window: adw::ApplicationWindow) {
                         }
                     }
                 }
+                "action" => {
+                    // action viewer.undo-edit: activate an action on the open viewer.
+                    if let Some(page) = find_page(window.upcast_ref()) {
+                        let _ = page.activate_action(arg, None);
+                    }
+                }
+                "dump" => {
+                    // dump N: item N's current edit, to stderr.
+                    let model = crate::model::model();
+                    if let Some(o) = model.all.item(arg.parse().unwrap_or(0)).and_downcast::<crate::asset_object::AssetObject>() {
+                        eprintln!("CLOUDPHOTOS_SCRIPT: edit = {:?}", o.with(|a| a.edit));
+                    }
+                }
                 "quit" => {
                     if let Some(app) = window.application() {
                         app.quit();

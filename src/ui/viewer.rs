@@ -34,6 +34,7 @@ struct Viewer {
     favorite_handler: RefCell<Option<glib::SignalHandlerId>>,
     loading: Cell<u64>,
     edit_button: gtk::Button,
+    show_original: gtk::ToggleButton,
     actions: gio::SimpleActionGroup,
     /// The Live Photo clip already loaded for the current item, replayed on
     /// later clicks rather than fetched again.
@@ -53,9 +54,12 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
     let info_button = gtk::ToggleButton::builder().icon_name("dialog-information-symbolic").tooltip_text("Info").build();
     let export = gtk::Button::builder().icon_name("document-save-symbolic").tooltip_text("Export…").build();
     let edit = gtk::Button::builder().icon_name("document-edit-symbolic").tooltip_text("Edit").build();
+    // Edited photos: compare against the untouched original.
+    let show_original = gtk::ToggleButton::builder().icon_name("view-reveal-symbolic").tooltip_text("Show Original").visible(false).build();
     let more_menu = gio::Menu::new();
-    more_menu.append(Some("Save Copy to iCloud"), Some("viewer.save-copy"));
+    more_menu.append(Some("Undo Last Edit"), Some("viewer.undo-edit"));
     more_menu.append(Some("Revert to Original"), Some("viewer.revert"));
+    more_menu.append(Some("Save Copy to iCloud"), Some("viewer.save-copy"));
     let more = gtk::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("More").menu_model(&more_menu).build();
     let delete = gtk::Button::builder().icon_name("user-trash-symbolic").tooltip_text("Delete").build();
     let live = gtk::Button::builder().label("LIVE").tooltip_text("Play Live Photo").visible(false).build();
@@ -65,6 +69,7 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
     header.pack_end(&info_button);
     header.pack_end(&export);
     header.pack_end(&edit);
+    header.pack_end(&show_original);
     header.pack_end(&favorite);
     header.pack_start(&live);
 
@@ -133,6 +138,7 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
         favorite_handler: RefCell::default(),
         loading: Cell::new(0),
         edit_button: edit.clone(),
+        show_original: show_original.clone(),
         actions: gio::SimpleActionGroup::new(),
         live_media: RefCell::default(),
         live_pending: Cell::new(false),
@@ -153,7 +159,13 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
         let (Some(object), Some(nav)) = (v.object.borrow().clone(), v.page.parent().and_downcast::<adw::NavigationView>()) else { return };
         editor::open(&nav, &v.toasts, &object);
     });
-    for (name, handler) in [("save-copy", Viewer::save_copy as fn(&Rc<Viewer>)), ("revert", Viewer::revert)] {
+    let v = viewer.clone();
+    show_original.connect_toggled(move |button| v.compare(button.is_active()));
+    for (name, handler) in [
+        ("save-copy", Viewer::save_copy as fn(&Rc<Viewer>)),
+        ("revert", Viewer::revert),
+        ("undo-edit", Viewer::undo_edit),
+    ] {
         let action = gio::SimpleAction::new(name, None);
         let v = viewer.clone();
         action.connect_activate(move |_, _| handler(&v));
@@ -279,9 +291,12 @@ impl Viewer {
         self.page.set_title(&asset.filename);
         self.live.set_visible(asset.live && asset.resources.contains_key(LIVE));
         self.edit_button.set_visible(!asset.is_video());
-        for name in ["save-copy", "revert"] {
+        self.show_original.set_active(false);
+        self.show_original.set_visible(asset.edit.is_some());
+        let can_undo = model().can_undo_edit(&object);
+        for (name, enabled) in [("save-copy", asset.edit.is_some()), ("revert", asset.edit.is_some()), ("undo-edit", can_undo)] {
             if let Some(action) = self.actions.lookup_action(name).and_downcast::<gio::SimpleAction>() {
-                action.set_enabled(asset.edit.is_some());
+                action.set_enabled(enabled);
             }
         }
         self.fill_info(&object);
@@ -474,6 +489,38 @@ impl Viewer {
             match model().save_copy_to_icloud(&object).await {
                 Ok(()) => this.toast("Saved to iCloud as a new photo."),
                 Err(e) => this.toast(&format!("Couldn't save to iCloud: {e}")),
+            }
+        });
+    }
+
+    fn undo_edit(self: &Rc<Self>) {
+        let Some(object) = self.object.borrow().clone() else { return };
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            match model().undo_edit(&object).await {
+                Ok(true) => this.toast(if object.with(|a| a.edit.is_none()) { "Back to the original." } else { "Undid the last edit." }),
+                Ok(false) => {}
+                Err(e) => this.toast(&format!("Couldn't undo: {e}")),
+            }
+        });
+    }
+
+    /// While on, show the untouched original's preview instead of the edit.
+    fn compare(self: &Rc<Self>, original: bool) {
+        let Some(object) = self.object.borrow().clone() else { return };
+        let id = object.id();
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            let model = model();
+            let texture = if original {
+                model.store.texture(&id, PREVIEW).await.ok()
+            } else {
+                model.texture(&object, PREVIEW).await
+            };
+            if this.object.borrow().as_ref() == Some(&object) && this.show_original.is_active() == original {
+                if let Some(texture) = texture {
+                    this.picture.set_paintable(Some(&texture));
+                }
             }
         });
     }

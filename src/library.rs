@@ -165,6 +165,15 @@ const SCHEMA: &str = "
         base_checksum TEXT,
         saved REAL NOT NULL
     );
+    -- Earlier saved versions, newest last; recipe NULL = the original.
+    -- Undo Last Edit steps back through them.
+    CREATE TABLE IF NOT EXISTS edit_history (
+        asset_id TEXT NOT NULL REFERENCES assets (id) ON DELETE CASCADE,
+        pos INTEGER NOT NULL,
+        recipe TEXT,
+        saved REAL NOT NULL,
+        PRIMARY KEY (asset_id, pos)
+    );
     CREATE TABLE IF NOT EXISTS albums (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -370,6 +379,14 @@ impl Library {
                     // EXIF, and a local edit made against the old one no
                     // longer fits.
                     tx.execute("UPDATE assets SET exif = NULL WHERE id = ?1", [&a.id])?;
+                    // Keep the edit: it goes into the history, so Undo Last
+                    // Edit can bring it back onto the new original.
+                    tx.execute(
+                        "INSERT INTO edit_history (asset_id, pos, recipe, saved)
+                         SELECT asset_id, (SELECT COALESCE(MAX(pos), 0) + 1 FROM edit_history WHERE asset_id = ?1), recipe, saved
+                         FROM edits WHERE asset_id = ?1",
+                        [&a.id],
+                    )?;
                     tx.execute("DELETE FROM edits WHERE asset_id = ?1", [&a.id])?;
                     tx.execute("DELETE FROM blobs WHERE asset_id = ?1 AND kind IN ('edited_thumb', 'edited_preview')", [&a.id])?;
                 }
@@ -457,6 +474,31 @@ impl Library {
             "INSERT OR REPLACE INTO edits (asset_id, recipe, base_checksum, saved) VALUES (?1, ?2, ?3, ?4)",
             params![id, serde_json::to_string(recipe).unwrap_or_default(), base_checksum, gtk::glib::real_time() as f64 / 1e6],
         );
+    }
+
+    /// Remember the version being replaced (`None` = the original).
+    pub fn push_history(&self, id: &str, recipe: Option<&crate::edit::Recipe>) {
+        let _ = self.db.execute(
+            "INSERT INTO edit_history (asset_id, pos, recipe, saved)
+             VALUES (?1, (SELECT COALESCE(MAX(pos), 0) + 1 FROM edit_history WHERE asset_id = ?1), ?2, ?3)",
+            params![id, recipe.map(|r| serde_json::to_string(r).unwrap_or_default()), gtk::glib::real_time() as f64 / 1e6],
+        );
+    }
+
+    /// Take the most recent earlier version: `Some(None)` means the original.
+    pub fn pop_history(&self, id: &str) -> Option<Option<crate::edit::Recipe>> {
+        let (pos, recipe): (i64, Option<String>) = self
+            .db
+            .query_row("SELECT pos, recipe FROM edit_history WHERE asset_id = ?1 ORDER BY pos DESC LIMIT 1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .ok()?;
+        let _ = self.db.execute("DELETE FROM edit_history WHERE asset_id = ?1 AND pos = ?2", params![id, pos]);
+        Some(recipe.and_then(|r| serde_json::from_str(&r).ok()))
+    }
+
+    pub fn has_history(&self, id: &str) -> bool {
+        self.db.query_row("SELECT 1 FROM edit_history WHERE asset_id = ?1 LIMIT 1", [id], |_| Ok(())).is_ok()
     }
 
     /// Back to the original: the recipe and its rendered images go.
@@ -726,9 +768,26 @@ mod tests {
         assert_eq!(lib.assets()[0].edit, Some(recipe));
         assert!(lib.missing().iter().all(|(_, k)| k != EDITED_THUMB), "rendered edits aren't downloads");
 
-        // Edited on the phone: the local edit no longer applies.
+        // Edited on the phone: the local edit no longer applies to the new
+        // original, but it's kept for Undo Last Edit.
         lib.apply_scan(&[asset("a", "2")], &[], &[], "t3").unwrap();
         assert_eq!(lib.assets()[0].edit, None);
         assert!(read_blob(&db, "a", EDITED_THUMB).is_none());
+        assert_eq!(lib.pop_history("a"), Some(Some(recipe)));
+        assert_eq!(lib.pop_history("a"), None);
+    }
+
+    #[test]
+    fn saved_versions_undo_in_order() {
+        let (_dir, mut lib) = setup();
+        lib.apply_scan(&[asset("a", "1")], &[], &[], "t1").unwrap();
+        let mut first = crate::edit::Recipe::default();
+        first.rotate_clockwise();
+        lib.push_history("a", None); // original -> first
+        lib.push_history("a", Some(&first)); // first -> second
+        assert!(lib.has_history("a"));
+        assert_eq!(lib.pop_history("a"), Some(Some(first)));
+        assert_eq!(lib.pop_history("a"), Some(None), "then back to the original");
+        assert!(!lib.has_history("a"));
     }
 }

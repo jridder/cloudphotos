@@ -443,9 +443,35 @@ impl Model {
 
     // ── editing ─────────────────────────────────────────────────────────────
 
-    /// Save a local edit (an identity recipe reverts). Renders the edited
-    /// thumbnail and preview from the full-resolution original.
+    /// Save a local edit (an identity recipe reverts). The version it
+    /// replaces is kept for Undo Last Edit; the original is never touched.
     pub async fn save_edit(self: &Rc<Self>, object: &AssetObject, recipe: Recipe) -> Result<(), String> {
+        let previous = object.with(|a| a.edit);
+        if previous == Some(recipe) || (previous.is_none() && recipe.is_identity()) {
+            return Ok(());
+        }
+        self.apply_edit(object, recipe).await?;
+        self.library.borrow().push_history(&object.id(), previous.as_ref());
+        Ok(())
+    }
+
+    /// Step back to the previously saved version (or the original).
+    pub async fn undo_edit(self: &Rc<Self>, object: &AssetObject) -> Result<bool, String> {
+        let Some(previous) = self.library.borrow().pop_history(&object.id()) else { return Ok(false) };
+        if let Err(e) = self.apply_edit(object, previous.unwrap_or_default()).await {
+            // Put it back so the step isn't lost.
+            self.library.borrow().push_history(&object.id(), previous.as_ref());
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    pub fn can_undo_edit(&self, object: &AssetObject) -> bool {
+        self.library.borrow().has_history(&object.id())
+    }
+
+    /// Render and store `recipe` (identity = back to the original).
+    async fn apply_edit(self: &Rc<Self>, object: &AssetObject, recipe: Recipe) -> Result<(), String> {
         let id = object.id();
         if recipe.is_identity() {
             self.library.borrow().remove_edit(&id);

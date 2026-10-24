@@ -36,6 +36,8 @@ mod imp {
         pub grab: Cell<Option<Grab>>,
         pub start: Cell<Option<Rect>>,
         pub changed: RefCell<Option<Box<dyn Fn()>>>,
+        /// Called when a drag ends, with the recipe from before it (one undo step).
+        pub committed: RefCell<Option<Box<dyn Fn(Recipe)>>>,
     }
 
     #[glib::object_subclass]
@@ -69,8 +71,17 @@ mod imp {
             let w = widget.downgrade();
             drag.connect_drag_end(move |_, _, _| {
                 if let Some(w) = w.upgrade() {
-                    w.imp().grab.set(None);
+                    let imp = w.imp();
+                    imp.grab.set(None);
                     w.queue_draw();
+                    if let Some(before) = imp.start.take() {
+                        let before = Recipe { crop: before, ..w.recipe() };
+                        if before != w.recipe() {
+                            if let Some(f) = imp.committed.borrow().as_ref() {
+                                f(before);
+                            }
+                        }
+                    }
                 }
             });
             widget.add_controller(drag);
@@ -133,6 +144,10 @@ impl CropCanvas {
 
     pub fn connect_changed(&self, f: impl Fn() + 'static) {
         self.imp().changed.replace(Some(Box::new(f)));
+    }
+
+    pub fn connect_committed(&self, f: impl Fn(Recipe) + 'static) {
+        self.imp().committed.replace(Some(Box::new(f)));
     }
 
     /// Change the recipe with `f` (rotate, flip…), keeping the aspect lock.
