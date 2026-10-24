@@ -91,6 +91,49 @@ def is_favorite(asset):
     return bool(record_field_value(asset.asset_record, "isFavorite"))
 
 
+def asset_details(asset):
+    """What Apple's records say beyond the basics: caption, keywords,
+    location, time zone, video length, HDR/burst. Best effort: a field that
+    can't be decoded is simply left out."""
+    from pyicloud.services.photos_cloudkit.mappers import record_field_value
+
+    record = asset.asset_record
+    out = {}
+    try:
+        from pyicloud.services.photos_cloudkit.materialize import build_xmp_metadata
+
+        meta = build_xmp_metadata(record)
+    except Exception:
+        meta = None
+    if meta is not None:
+        for key, value in (
+            ("caption", meta.title),
+            ("description", meta.description),
+            ("keywords", meta.keywords),
+            ("latitude", meta.gps_latitude),
+            ("longitude", meta.gps_longitude),
+            ("altitude", meta.gps_altitude),
+            ("speed", meta.gps_speed),
+        ):
+            if value not in (None, "", []):
+                out[key] = value
+    for key, field_name in (
+        ("timezone_offset", "timeZoneOffset"),
+        ("duration", "duration"),
+        ("hdr", "assetHDRType"),
+        ("burst", "burstId"),
+        ("edited", "adjustmentRenderType"),
+        ("hidden", "isHidden"),
+    ):
+        try:
+            value = record_field_value(record, field_name)
+        except Exception:
+            value = None
+        if value not in (None, "", 0):
+            out[key] = value
+    return out
+
+
 def asset_dict(asset):
     resources = asset_resources(asset)
     if "original" not in resources:
@@ -111,6 +154,7 @@ def asset_dict(asset):
         "live": bool(asset.is_live_photo),
         "favorite": is_favorite(asset),
         "resources": resources,
+        "details": asset_details(asset),
     }
 
 

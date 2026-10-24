@@ -57,6 +57,10 @@ pub struct Asset {
     pub favorite: bool,
     /// thumb, preview, original, and live when present
     pub resources: HashMap<String, Resource>,
+    /// From Apple's records: caption, keywords, latitude/longitude, time
+    /// zone, video duration… (see the helper's asset_details).
+    #[serde(default)]
+    pub details: serde_json::Value,
 }
 
 impl Asset {
@@ -172,6 +176,15 @@ impl Library {
         }
         configure(&db)?;
         db.execute_batch(SCHEMA)?;
+        // Columns added after the first release.
+        for (column, ddl) in [("details", "ALTER TABLE assets ADD COLUMN details TEXT"), ("exif", "ALTER TABLE assets ADD COLUMN exif TEXT")] {
+            let present: bool = db
+                .prepare("SELECT 1 FROM pragma_table_info('assets') WHERE name = ?1")?
+                .exists([column])?;
+            if !present {
+                db.execute(ddl, [])?;
+            }
+        }
         Ok(Self { path: path.to_owned(), db })
     }
 
@@ -204,7 +217,7 @@ impl Library {
             }
         }
         let Ok(mut stmt) = self.db.prepare(
-            "SELECT id, master, filename, kind, taken, added, width, height, size, live, favorite
+            "SELECT id, master, filename, kind, taken, added, width, height, size, live, favorite, details
              FROM assets WHERE deleted = 0 ORDER BY taken DESC, id",
         ) else {
             return vec![];
@@ -224,6 +237,10 @@ impl Library {
                 size: r.get(8)?,
                 live: r.get::<_, i64>(9)? != 0,
                 favorite: r.get::<_, i64>(10)? != 0,
+                details: r
+                    .get::<_, Option<String>>(11)?
+                    .and_then(|d| serde_json::from_str(&d).ok())
+                    .unwrap_or_default(),
             })
         })
         .map(|rows| rows.flatten().collect())
@@ -298,10 +315,10 @@ impl Library {
         };
         {
             let mut upsert = tx.prepare(
-                "INSERT INTO assets (id, master, filename, kind, taken, added, width, height, size, live, favorite, deleted)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)
+                "INSERT INTO assets (id, master, filename, kind, taken, added, width, height, size, live, favorite, deleted, details)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)
                  ON CONFLICT (id) DO UPDATE SET master = ?2, filename = ?3, kind = ?4, taken = ?5, added = ?6,
-                     width = ?7, height = ?8, size = ?9, live = ?10, favorite = ?11, deleted = 0",
+                     width = ?7, height = ?8, size = ?9, live = ?10, favorite = ?11, deleted = 0, details = ?12",
             )?;
             let mut clear = tx.prepare("DELETE FROM resources WHERE asset_id = ?1")?;
             let mut resource = tx.prepare(
@@ -314,9 +331,15 @@ impl Library {
                     Some((old, _)) if *old != original => diff.updated += 1,
                     _ => {}
                 }
+                let details = (!a.details.is_null()).then(|| a.details.to_string());
                 upsert.execute(params![
-                    a.id, a.master, a.filename, a.kind, a.taken, a.added, a.width, a.height, a.size, a.live as i64, a.favorite as i64
+                    a.id, a.master, a.filename, a.kind, a.taken, a.added, a.width, a.height, a.size, a.live as i64, a.favorite as i64,
+                    details
                 ])?;
+                if diff_changed(&existing, a, &original) {
+                    // A new original means new EXIF.
+                    tx.execute("UPDATE assets SET exif = NULL WHERE id = ?1", [&a.id])?;
+                }
                 clear.execute([&a.id])?;
                 for (kind, r) in &a.resources {
                     resource.execute(params![a.id, kind, r.size, r.width, r.height, r.kind, r.checksum])?;
@@ -359,6 +382,25 @@ impl Library {
         Ok(diff)
     }
 
+    pub fn set_meta(&self, key: &str, value: &str) {
+        let _ = self.db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)", [key, value]);
+    }
+
+    /// EXIF read from the original, if it has been read before.
+    pub fn exif(&self, id: &str) -> Option<serde_json::Value> {
+        self.db
+            .query_row("SELECT exif FROM assets WHERE id = ?1", [id], |r| r.get::<_, Option<String>>(0))
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    }
+
+    pub fn set_exif(&self, id: &str, exif: &serde_json::Value) {
+        let _ = self.db.execute("UPDATE assets SET exif = ?2 WHERE id = ?1", params![id, exif.to_string()]);
+    }
+
     pub fn set_favorite(&self, id: &str, value: bool) {
         let _ = self.db.execute("UPDATE assets SET favorite = ?2 WHERE id = ?1", params![id, value as i64]);
     }
@@ -367,6 +409,16 @@ impl Library {
     pub fn mark_deleted(&self, id: &str) {
         let _ = self.db.execute("UPDATE assets SET deleted = 1 WHERE id = ?1", [id]);
     }
+}
+
+fn diff_changed(existing: &HashMap<String, (Option<String>, i64)>, asset: &Asset, original: &Option<String>) -> bool {
+    existing.get(&asset.id).is_some_and(|(old, _)| old != original)
+}
+
+/// Read-only access to one blob, for parsers that need to seek (EXIF).
+pub fn open_blob<'a>(db: &'a Connection, id: &str, kind: &str) -> rusqlite::Result<rusqlite::blob::Blob<'a>> {
+    let rowid: i64 = db.query_row("SELECT rowid FROM blobs WHERE asset_id = ?1 AND kind = ?2", [id, kind], |r| r.get(0))?;
+    db.blob_open(MAIN_DB, c"blobs", c"data", rowid, true)
 }
 
 // ── blobs (any thread, own connection) ──────────────────────────────────────
@@ -439,6 +491,7 @@ mod tests {
             live: false,
             favorite: false,
             resources,
+            details: serde_json::Value::Null,
         }
     }
 

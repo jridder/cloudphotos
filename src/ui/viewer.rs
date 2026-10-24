@@ -10,7 +10,7 @@ use crate::{
     library::{LIVE, ORIGINAL, PREVIEW, THUMB},
     model::model,
     store,
-    ui::grid::format_date,
+    ui::{grid::format_date, info},
 };
 
 struct Viewer {
@@ -27,7 +27,7 @@ struct Viewer {
     zoom: Cell<f64>,
     favorite: gtk::ToggleButton,
     live: gtk::Button,
-    info_list: gtk::ListBox,
+    info_box: gtk::Box,
     prev: gtk::Button,
     next: gtk::Button,
     favorite_handler: RefCell<Option<glib::SignalHandlerId>>,
@@ -72,19 +72,20 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
     overlay.add_overlay(&next);
     overlay.add_css_class("viewer");
 
-    let info_list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
-    info_list.add_css_class("boxed-list");
     let info_inner = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
+        .spacing(18)
         .margin_start(12)
         .margin_end(12)
         .margin_top(12)
         .margin_bottom(12)
         .build();
-    info_inner.append(&info_list);
+    // A fixed-width sidebar: long values (lens names) wrap rather than widen it.
     let info_box = gtk::ScrolledWindow::builder()
         .child(&info_inner)
-        .width_request(300)
+        .width_request(340)
+        .hexpand(false)
+        .propagate_natural_width(false)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
     let info = gtk::Revealer::builder()
@@ -116,7 +117,7 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
         zoom: Cell::new(0.0),
         favorite,
         live,
-        info_list,
+        info_box: info_inner.clone(),
         prev,
         next,
         favorite_handler: RefCell::default(),
@@ -346,38 +347,13 @@ impl Viewer {
         }
     }
 
-    fn fill_info(&self, object: &AssetObject) {
-        while let Some(child) = self.info_list.first_child() {
-            self.info_list.remove(&child);
-        }
-        let asset = object.asset();
-        let kind = match (asset.is_video(), asset.live) {
-            (true, _) => "Video",
-            (false, true) => "Live Photo",
-            _ => "Photo",
-        };
-        let mut rows = vec![
-            ("Date", format_date(asset.taken)),
-            ("File", asset.filename.clone()),
-            ("Type", kind.to_string()),
-            ("Dimensions", format!("{} × {}", asset.width, asset.height)),
-            ("Size", glib::format_size(asset.size).to_string()),
-        ];
-        let albums: Vec<String> = model()
-            .albums()
-            .into_iter()
-            .filter(|a| a.kind == "user" && a.assets.contains(&asset.id))
-            .map(|a| a.name.replace('/', " › "))
-            .collect();
-        if !albums.is_empty() {
-            rows.push(("Albums", albums.join(", ")));
-        }
-        for (title, value) in rows {
-            let row = adw::ActionRow::builder().title(title).subtitle(glib::markup_escape_text(&value)).build();
-            row.add_css_class("property");
-            row.set_subtitle_selectable(true);
-            self.info_list.append(&row);
-        }
+    fn fill_info(self: &Rc<Self>, object: &AssetObject) {
+        let weak = Rc::downgrade(self);
+        let id = object.id();
+        let still_current = Rc::new(move || {
+            weak.upgrade().is_some_and(|v| v.object.borrow().as_ref().is_some_and(|o| o.id() == id))
+        });
+        info::fill(&self.info_box, object, still_current);
     }
 
     fn toggle_favorite(self: &Rc<Self>, value: bool) {

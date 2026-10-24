@@ -5,6 +5,7 @@
 //! reuses icloud-linux's sign-in.
 
 mod asset_object;
+mod exif;
 mod helper;
 mod library;
 mod model;
@@ -33,8 +34,12 @@ fn main() -> glib::ExitCode {
     }
     glib::set_application_name("Cloud Photos");
     let mut flags = gio::ApplicationFlags::empty();
-    // Fake-library runs (tests, screenshots) are their own instance.
-    if std::env::var_os("CLOUDPHOTOS_FAKE").is_some() {
+    // Test runs (fake or other library, offline, scripted) are their own
+    // instance, never a message to the app you have open.
+    let test_run = ["CLOUDPHOTOS_FAKE", "CLOUDPHOTOS_LIBRARY", "CLOUDPHOTOS_OFFLINE", "CLOUDPHOTOS_SCRIPT"]
+        .iter()
+        .any(|v| std::env::var_os(v).is_some());
+    if test_run {
         flags |= gio::ApplicationFlags::NON_UNIQUE;
     }
     let app = adw::Application::builder().application_id(APP_ID).flags(flags).build();

@@ -42,6 +42,8 @@ pub struct Download {
 
 enum Work {
     Decode(String, String, async_channel::Sender<Result<gdk::Texture>>),
+    Exif(String, async_channel::Sender<serde_json::Value>),
+    Has(String, String, async_channel::Sender<bool>),
     CopyOut(String, String, PathBuf, async_channel::Sender<Result<PathBuf>>),
 }
 
@@ -80,6 +82,18 @@ impl Store {
                     match job {
                         Work::Decode(id, kind, reply) => {
                             let _ = reply.send_blocking(decode(&library, &id, &kind));
+                        }
+                        Work::Has(id, kind, reply) => {
+                            let has = with_db(&library, |db| {
+                                db.query_row("SELECT 1 FROM blobs WHERE asset_id = ?1 AND kind = ?2", [&id, &kind], |_| Ok(()))
+                                    .is_ok()
+                            })
+                            .unwrap_or(false);
+                            let _ = reply.send_blocking(has);
+                        }
+                        Work::Exif(id, reply) => {
+                            let exif = with_db(&library, |db| crate::exif::read(db, &id)).unwrap_or_default();
+                            let _ = reply.send_blocking(exif);
                         }
                         Work::CopyOut(id, kind, target, reply) => {
                             let _ = reply.send_blocking(copy_out(&library, &id, &kind, &target));
@@ -140,6 +154,19 @@ impl Store {
         for waiter in self.waiting.borrow_mut().remove(&key).unwrap_or_default() {
             let _ = waiter.try_send(());
         }
+    }
+
+    pub async fn has(&self, id: &str, kind: &str) -> bool {
+        let (tx, rx) = async_channel::bounded(1);
+        let _ = self.work.send(Work::Has(id.into(), kind.into(), tx)).await;
+        rx.recv().await.unwrap_or(false)
+    }
+
+    /// Camera details from the stored original (`Null` if none or not downloaded).
+    pub async fn exif(&self, id: &str) -> serde_json::Value {
+        let (tx, rx) = async_channel::bounded(1);
+        let _ = self.work.send(Work::Exif(id.into(), tx)).await;
+        rx.recv().await.unwrap_or_default()
     }
 
     /// Copy a stored file out to `target` (export).

@@ -42,6 +42,9 @@ pub enum Event {
 
 /// Items whose links are fetched in one request, then downloaded.
 const BATCH: usize = 100;
+/// Bumped when scans start recording something new for existing items,
+/// so the next start rescans once to fill it in.
+const SCAN_VERSION: &str = "2";
 
 pub struct Model {
     helper: RefCell<Option<Rc<Helper>>>,
@@ -148,6 +151,10 @@ impl Model {
     }
 
     async fn connect(self: Rc<Self>) {
+        // Browse what's on this computer without contacting iCloud.
+        if std::env::var_os("CLOUDPHOTOS_OFFLINE").is_some() {
+            return self.set_state(State::Offline("Offline: showing the library on this computer.".into()));
+        }
         self.set_state(State::Starting);
         let weak = Rc::downgrade(&self);
         let helper = match Helper::spawn(move |event| {
@@ -169,7 +176,8 @@ impl Model {
             Ok(v) => v.get("changed").and_then(Value::as_bool).unwrap_or(true),
             Err(_) => true,
         };
-        if changed || self.all.n_items() == 0 {
+        let outdated = self.library.borrow().meta("scan_version").as_deref() != Some(SCAN_VERSION);
+        if changed || outdated || self.all.n_items() == 0 {
             self.scan().await;
         }
         self.sync().await;
@@ -206,6 +214,9 @@ impl Model {
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_default();
                 let result = self.library.borrow_mut().apply_scan(&assets, &albums, &trash, token);
+                if result.is_ok() {
+                    self.library.borrow().set_meta("scan_version", SCAN_VERSION);
+                }
                 match result {
                     Ok(diff) if diff.added + diff.updated + diff.deleted + diff.purged > 0 => {
                         eprintln!("cloudphotos: scan {diff:?}");
@@ -393,6 +404,25 @@ impl Model {
             }
             Err(_) => None,
         }
+    }
+
+    /// Camera details for the Info panel: from the library, or read from the
+    /// original (once it's downloaded) and saved.
+    pub async fn exif(self: &Rc<Self>, object: &AssetObject) -> serde_json::Value {
+        let id = object.id();
+        if let Some(exif) = self.library.borrow().exif(&id) {
+            return exif;
+        }
+        let exif = self.store.exif(&id).await;
+        if !exif.is_null() {
+            self.library.borrow().set_exif(&id, &exif);
+        }
+        exif
+    }
+
+    /// Whether the original is in the library yet.
+    pub async fn has_original(self: &Rc<Self>, object: &AssetObject) -> bool {
+        self.store.has(&object.id(), crate::library::ORIGINAL).await
     }
 
     // ── changes ─────────────────────────────────────────────────────────────
