@@ -143,6 +143,15 @@ const SCHEMA: &str = "
         data BLOB NOT NULL,
         UNIQUE (asset_id, kind)
     );
+    -- Files larger than PART_SIZE: blobs holds the first part, the rest
+    -- continue here in order (SQLite caps a single value at 1 GB).
+    CREATE TABLE IF NOT EXISTS blob_parts (
+        asset_id TEXT NOT NULL REFERENCES assets (id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        part INTEGER NOT NULL,
+        data BLOB NOT NULL,
+        UNIQUE (asset_id, kind, part)
+    );
     CREATE TABLE IF NOT EXISTS albums (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -287,7 +296,11 @@ impl Library {
     pub fn totals(&self) -> ((u64, u64), (u64, u64)) {
         let stored = self
             .db
-            .query_row("SELECT COUNT(*), COALESCE(SUM(length(data)), 0) FROM blobs", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(data)), 0) + (SELECT COALESCE(SUM(length(data)), 0) FROM blob_parts) FROM blobs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap_or((0, 0));
         let wanted = self
             .db
@@ -431,39 +444,72 @@ pub fn read_blob(db: &Connection, id: &str, kind: &str) -> Option<Vec<u8>> {
         .flatten()
 }
 
-/// Stream a blob into `out` (originals, videos).
+/// Largest piece stored in one row; bigger files are split across rows.
+#[cfg(not(test))]
+pub const PART_SIZE: u64 = 256 << 20;
+#[cfg(test)]
+pub const PART_SIZE: u64 = 1 << 20;
+
+/// Stream a stored file into `out` (originals, videos), joining its parts.
 pub fn copy_blob_to(db: &Connection, id: &str, kind: &str, out: &mut impl Write) -> std::io::Result<u64> {
     let rowid: i64 = db
         .query_row("SELECT rowid FROM blobs WHERE asset_id = ?1 AND kind = ?2", [id, kind], |r| r.get(0))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e))?;
     let mut blob = db.blob_open(MAIN_DB, c"blobs", c"data", rowid, true).map_err(std::io::Error::other)?;
-    std::io::copy(&mut blob, out)
+    let mut total = std::io::copy(&mut blob, out)?;
+    let parts: Vec<i64> = db
+        .prepare("SELECT rowid FROM blob_parts WHERE asset_id = ?1 AND kind = ?2 ORDER BY part")
+        .and_then(|mut stmt| stmt.query_map([id, kind], |r| r.get(0))?.collect())
+        .map_err(std::io::Error::other)?;
+    for rowid in parts {
+        let mut blob = db.blob_open(MAIN_DB, c"blob_parts", c"data", rowid, true).map_err(std::io::Error::other)?;
+        total += std::io::copy(&mut blob, out)?;
+    }
+    Ok(total)
 }
 
-/// Store the file at `source` as a blob, streaming it in.
+/// Store the file at `source`, streaming it in, split into PART_SIZE pieces.
 pub fn write_blob_from(db: &Connection, id: &str, kind: &str, checksum: Option<&str>, source: &Path) -> std::io::Result<()> {
     let len = std::fs::metadata(source)?.len();
+    let mut file = std::fs::File::open(source)?;
     let tx = db.unchecked_transaction().map_err(std::io::Error::other)?;
     tx.execute("DELETE FROM blobs WHERE asset_id = ?1 AND kind = ?2", [id, kind]).map_err(std::io::Error::other)?;
+    tx.execute("DELETE FROM blob_parts WHERE asset_id = ?1 AND kind = ?2", [id, kind]).map_err(std::io::Error::other)?;
+    let first = len.min(PART_SIZE);
     tx.execute(
         "INSERT INTO blobs (asset_id, kind, checksum, saved, data) VALUES (?1, ?2, ?3, ?4, zeroblob(?5))",
-        params![id, kind, checksum, gtk::glib::real_time() as f64 / 1e6, len as i64],
+        params![id, kind, checksum, gtk::glib::real_time() as f64 / 1e6, first as i64],
     )
     .map_err(std::io::Error::other)?;
-    let rowid = tx.last_insert_rowid();
-    {
-        let mut blob = tx.blob_open(MAIN_DB, c"blobs", c"data", rowid, false).map_err(std::io::Error::other)?;
-        let mut file = std::fs::File::open(source)?;
-        let mut buffer = vec![0u8; 1 << 20];
-        loop {
-            let n = file.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            blob.write_all(&buffer[..n])?;
-        }
+    fill(&tx, c"blobs", tx.last_insert_rowid(), &mut file, first)?;
+    let mut written = first;
+    let mut part = 1i64;
+    while written < len {
+        let size = (len - written).min(PART_SIZE);
+        tx.execute(
+            "INSERT INTO blob_parts (asset_id, kind, part, data) VALUES (?1, ?2, ?3, zeroblob(?4))",
+            params![id, kind, part, size as i64],
+        )
+        .map_err(std::io::Error::other)?;
+        fill(&tx, c"blob_parts", tx.last_insert_rowid(), &mut file, size)?;
+        written += size;
+        part += 1;
     }
     tx.commit().map_err(std::io::Error::other)
+}
+
+/// Copy exactly `size` bytes from `file` into a zeroblob row.
+fn fill(db: &Connection, table: &std::ffi::CStr, rowid: i64, file: &mut std::fs::File, size: u64) -> std::io::Result<()> {
+    let mut blob = db.blob_open(MAIN_DB, table, c"data", rowid, false).map_err(std::io::Error::other)?;
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut left = size;
+    while left > 0 {
+        let want = left.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..want])?;
+        blob.write_all(&buffer[..want])?;
+        left -= want as u64;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -575,6 +621,24 @@ mod tests {
         assert_eq!(copy_blob_to(&db, "a", ORIGINAL, &mut out).unwrap(), big.len() as u64);
         assert_eq!(out, big);
         assert_eq!(lib.totals().0, (1, big.len() as u64));
+        let parts: i64 = db.query_row("SELECT COUNT(*) FROM blob_parts", [], |r| r.get(0)).unwrap();
+        assert_eq!(parts, 3, "3.5 MB in 1 MB parts: first in blobs, three more");
+
+        // Replacing it with a smaller file drops the old parts.
+        std::fs::write(dir.join("small"), b"tiny").unwrap();
+        write_blob_from(&db, "a", ORIGINAL, Some("1-original"), &dir.join("small")).unwrap();
+        let parts: i64 = db.query_row("SELECT COUNT(*) FROM blob_parts", [], |r| r.get(0)).unwrap();
+        assert_eq!(parts, 0);
+        let mut out = Vec::new();
+        copy_blob_to(&db, "a", ORIGINAL, &mut out).unwrap();
+        assert_eq!(out, b"tiny");
+
+        // Purging the photo removes its parts too.
+        std::fs::write(dir.join("big"), &big).unwrap();
+        write_blob_from(&db, "a", ORIGINAL, Some("1-original"), &dir.join("big")).unwrap();
+        lib.apply_scan(&[], &[], &[], "t2").unwrap();
+        let parts: i64 = db.query_row("SELECT COUNT(*) FROM blob_parts", [], |r| r.get(0)).unwrap();
+        assert_eq!(parts, 0);
     }
 
     #[test]
