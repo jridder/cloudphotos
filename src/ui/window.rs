@@ -342,19 +342,28 @@ impl Window {
 }
 
 impl Window {
+    /// The sidebar footer: download progress, or what's still missing. Once
+    /// everything is downloaded there's nothing to say, so it hides.
     fn update_sync(&self, progress: Option<(usize, usize, u64)>) {
-        self.sync_box.set_visible(true);
         self.sync_bar.set_visible(progress.is_some());
         if progress.is_none() {
-            // Idle: what the library holds, and where.
             let model = model();
             let ((files, bytes), (wanted, _)) = model.totals();
-            let path = model.library_path();
-            let folder = path.parent().map(|p| p.to_string_lossy().replace(&*glib::home_dir().to_string_lossy(), "~")).unwrap_or_default();
-            let complete = if files >= wanted { "All downloaded" } else { "Partly downloaded" };
-            self.sync_label.set_label(&format!("{complete} · {} on this computer\n{folder}", glib::format_size(bytes)));
-            self.sync_box.set_tooltip_text(Some(&path.to_string_lossy()));
+            let complete = files >= wanted;
+            self.sync_box.set_visible(!complete);
+            if !complete {
+                let path = model.library_path();
+                let folder = path.parent().map(|p| p.to_string_lossy().replace(&*glib::home_dir().to_string_lossy(), "~")).unwrap_or_default();
+                self.sync_label.set_label(&format!(
+                    "Partly downloaded · {} of {wanted} files · {} on this computer\n{folder}",
+                    files.min(wanted),
+                    glib::format_size(bytes)
+                ));
+                self.sync_box.set_tooltip_text(Some(&path.to_string_lossy()));
+            }
+            return;
         }
+        self.sync_box.set_visible(true);
         if let Some((done, total, bytes)) = progress {
             self.sync_label.set_label(&format!(
                 "Downloading your library · {done} of {total} files · {}",
