@@ -35,6 +35,7 @@
   <releases>
     <release version="0.1.1" date="2026-10-24">
       <description>
+        <p>Recently Deleted: deleted photos and videos, with the days left before iCloud removes them, to recover or delete for good.</p>
         <p>Export choices: the original file, JPEG (with a quality setting), PNG or TIFF; full size or smaller; and whether to include the location. The last choices are remembered.</p>
         <p>Right-click a photo or video, in the grid of any collection or album or in the viewer, for Open, Favorite, Edit, Export, edit history and Delete. Shift+F10 or the Menu key opens it from the keyboard, and Delete deletes in the viewer.</p>
         <p>Deleting and favoriting respond right away: the photo's record is looked up directly instead of searching the whole library, which could take a minute or more with no feedback.</p>

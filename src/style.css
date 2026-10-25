@@ -48,3 +48,10 @@
   color: var(--accent-color);
   font-weight: bold;
 }
+
+.photo-cell .days-left {
+  color: white;
+  background-color: alpha(black, 0.55);
+  border-radius: 999px;
+  padding: 1px 8px;
+}

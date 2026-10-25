@@ -17,6 +17,7 @@ enum Collection {
     Library,
     Favorites,
     Videos,
+    RecentlyDeleted,
     Album(String, String), // id, name
 }
 
@@ -26,6 +27,7 @@ impl Collection {
             Collection::Library => "Library".into(),
             Collection::Favorites => "Favorites".into(),
             Collection::Videos => "Videos".into(),
+            Collection::RecentlyDeleted => "Recently Deleted".into(),
             Collection::Album(_, name) => name.rsplit('/').next().unwrap_or(name).into(),
         }
     }
@@ -47,6 +49,7 @@ impl Collection {
                 let filter = gtk::CustomFilter::new(|o| o.downcast_ref::<AssetObject>().is_some_and(|a| a.with(|x| x.is_video())));
                 gtk::FilterListModel::new(Some(model.all.clone()), Some(filter)).upcast()
             }
+            Collection::RecentlyDeleted => model.trash.clone().upcast(),
             Collection::Album(id, _) => model.album_items(id).upcast(),
         }
     }
@@ -237,6 +240,7 @@ impl Window {
                 add(label, icon, Collection::Album(album.id.clone(), label.into()));
             }
         }
+        add("Recently Deleted", "user-trash-symbolic", Collection::RecentlyDeleted);
         let user: Vec<_> = albums.iter().filter(|a| a.kind == "user").collect();
         if !user.is_empty() {
             let heading = gtk::Label::builder().label("Albums").xalign(0.0).margin_top(12).margin_start(12).build();
@@ -258,6 +262,10 @@ impl Window {
     }
 
     fn show(&self, collection: Collection) {
+        // Leave the viewer (or editor) for the newly chosen collection's grid.
+        if self.current.borrow().clone() != collection {
+            self.nav.pop_to_tag("grid");
+        }
         let items = collection.items();
         self.grid.set_model(&items);
         self.title.set_title(&collection.title());
@@ -293,6 +301,11 @@ impl Window {
             (State::Offline(message), true) => Some(("Can't Reach iCloud", "network-offline-symbolic", message.clone())),
             (State::Starting, true) => Some(("Connecting to iCloud…", "content-loading-symbolic", String::new())),
             (State::Ready, true) if model().is_scanning() => None,
+            (State::Ready, true) if *self.current.borrow() == Collection::RecentlyDeleted => Some((
+                "No Recently Deleted Items",
+                "user-trash-symbolic",
+                "Deleted photos and videos stay here for 30 days before iCloud removes them for good.".into(),
+            )),
             (State::Ready, true) => Some(("No Photos", "image-x-generic-symbolic", String::new())),
             _ => None,
         };

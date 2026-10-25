@@ -67,6 +67,45 @@ pub struct Asset {
     /// A local edit (rotate/flip/crop), if any.
     #[serde(default)]
     pub edit: Option<crate::edit::Recipe>,
+    /// In Recently Deleted (hidden from the library, kept until purged).
+    #[serde(default)]
+    pub deleted: bool,
+    /// When iCloud removes a deleted item for good (Unix seconds), if known.
+    #[serde(default)]
+    pub expires: Option<f64>,
+}
+
+/// How long Recently Deleted keeps an item.
+pub const TRASH_DAYS: f64 = 30.0;
+
+/// An item in iCloud's Recently Deleted, and when it expires if known.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(from = "TrashedJson")]
+pub struct Trashed {
+    pub id: String,
+    pub expires: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TrashedJson {
+    Id(String),
+    Item { id: String, expires: Option<f64> },
+}
+
+impl From<TrashedJson> for Trashed {
+    fn from(json: TrashedJson) -> Self {
+        match json {
+            TrashedJson::Id(id) => Trashed { id, expires: None },
+            TrashedJson::Item { id, expires } => Trashed { id, expires },
+        }
+    }
+}
+
+impl From<&str> for Trashed {
+    fn from(id: &str) -> Self {
+        Trashed { id: id.into(), expires: None }
+    }
 }
 
 impl Asset {
@@ -208,7 +247,11 @@ impl Library {
         configure(&db)?;
         db.execute_batch(SCHEMA)?;
         // Columns added after the first release.
-        for (column, ddl) in [("details", "ALTER TABLE assets ADD COLUMN details TEXT"), ("exif", "ALTER TABLE assets ADD COLUMN exif TEXT")] {
+        for (column, ddl) in [
+            ("details", "ALTER TABLE assets ADD COLUMN details TEXT"),
+            ("exif", "ALTER TABLE assets ADD COLUMN exif TEXT"),
+            ("expires", "ALTER TABLE assets ADD COLUMN expires REAL"),
+        ] {
             let present: bool = db
                 .prepare("SELECT 1 FROM pragma_table_info('assets') WHERE name = ?1")?
                 .exists([column])?;
@@ -227,6 +270,17 @@ impl Library {
 
     /// Visible items, newest first.
     pub fn assets(&self) -> Vec<Asset> {
+        self.load(false)
+    }
+
+    /// Items in Recently Deleted, the most recently deleted first.
+    pub fn deleted_assets(&self) -> Vec<Asset> {
+        let mut items = self.load(true);
+        items.sort_by(|a, b| b.expires.unwrap_or(0.0).total_cmp(&a.expires.unwrap_or(0.0)));
+        items
+    }
+
+    fn load(&self, deleted: bool) -> Vec<Asset> {
         let mut resources: HashMap<String, HashMap<String, Resource>> = HashMap::new();
         if let Ok(mut stmt) = self.db.prepare("SELECT asset_id, kind, size, width, height, uti, checksum FROM resources") {
             let rows = stmt.query_map([], |r| {
@@ -249,13 +303,13 @@ impl Library {
         }
         let Ok(mut stmt) = self.db.prepare(
             "SELECT a.id, a.master, a.filename, a.kind, a.taken, a.added, a.width, a.height, a.size, a.live, a.favorite,
-                    a.details, e.recipe
+                    a.details, e.recipe, a.deleted, a.expires
              FROM assets a LEFT JOIN edits e ON e.asset_id = a.id
-             WHERE a.deleted = 0 ORDER BY a.taken DESC, a.id",
+             WHERE a.deleted = ?1 ORDER BY a.taken DESC, a.id",
         ) else {
             return vec![];
         };
-        stmt.query_map([], |r| {
+        stmt.query_map([deleted as i64], |r| {
             let id: String = r.get(0)?;
             Ok(Asset {
                 resources: resources.remove(&id).unwrap_or_default(),
@@ -275,6 +329,8 @@ impl Library {
                     .and_then(|d| serde_json::from_str(&d).ok())
                     .unwrap_or_default(),
                 edit: r.get::<_, Option<String>>(12)?.and_then(|e| serde_json::from_str(&e).ok()),
+                deleted: r.get::<_, i64>(13)? != 0,
+                expires: r.get(14)?,
             })
         })
         .map(|rows| rows.flatten().collect())
@@ -342,7 +398,7 @@ impl Library {
 
     /// Merge a full listing from iCloud. Items now in Recently Deleted are
     /// hidden but kept; items gone from iCloud entirely are purged, files and all.
-    pub fn apply_scan(&mut self, assets: &[Asset], albums: &[Album], recently_deleted: &[String], sync_token: &str) -> rusqlite::Result<Diff> {
+    pub fn apply_scan(&mut self, assets: &[Asset], albums: &[Album], recently_deleted: &[Trashed], sync_token: &str) -> rusqlite::Result<Diff> {
         let mut diff = Diff::default();
         let tx = self.db.transaction()?;
         let existing: HashMap<String, (Option<String>, i64)> = {
@@ -356,7 +412,7 @@ impl Library {
                 "INSERT INTO assets (id, master, filename, kind, taken, added, width, height, size, live, favorite, deleted, details)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)
                  ON CONFLICT (id) DO UPDATE SET master = ?2, filename = ?3, kind = ?4, taken = ?5, added = ?6,
-                     width = ?7, height = ?8, size = ?9, live = ?10, favorite = ?11, deleted = 0, details = ?12",
+                     width = ?7, height = ?8, size = ?9, live = ?10, favorite = ?11, deleted = 0, expires = NULL, details = ?12",
             )?;
             let mut clear = tx.prepare("DELETE FROM resources WHERE asset_id = ?1")?;
             let mut resource = tx.prepare(
@@ -397,11 +453,14 @@ impl Library {
             }
         }
         let listed: std::collections::HashSet<&str> = assets.iter().map(|a| a.id.as_str()).collect();
-        let in_trash: std::collections::HashSet<&str> = recently_deleted.iter().map(String::as_str).collect();
+        let in_trash: HashMap<&str, Option<f64>> = recently_deleted.iter().map(|t| (t.id.as_str(), t.expires)).collect();
         for id in existing.keys().filter(|id| !listed.contains(id.as_str())) {
-            if in_trash.contains(id.as_str()) {
+            if let Some(expires) = in_trash.get(id.as_str()) {
                 if tx.execute("UPDATE assets SET deleted = 1 WHERE id = ?1 AND deleted = 0", [id])? > 0 {
                     diff.deleted += 1;
+                }
+                if let Some(expires) = expires {
+                    tx.execute("UPDATE assets SET expires = ?2 WHERE id = ?1", params![id, expires])?;
                 }
             } else {
                 tx.execute("DELETE FROM assets WHERE id = ?1", [id])?;
@@ -512,8 +571,24 @@ impl Library {
     }
 
     /// Moved to Recently Deleted from this app: hide it, keep its files.
-    pub fn mark_deleted(&self, id: &str) {
-        let _ = self.db.execute("UPDATE assets SET deleted = 1 WHERE id = ?1", [id]);
+    /// Moved to Recently Deleted: hidden, and expiring `TRASH_DAYS` from now
+    /// until a scan reports iCloud's own date.
+    pub fn mark_deleted(&self, id: &str) -> f64 {
+        let expires = gtk::glib::real_time() as f64 / 1e6 + TRASH_DAYS * 86_400.0;
+        let _ = self.db.execute("UPDATE assets SET deleted = 1, expires = ?2 WHERE id = ?1", params![id, expires]);
+        expires
+    }
+
+    /// Back from Recently Deleted.
+    pub fn restore(&self, id: &str) {
+        let _ = self.db.execute("UPDATE assets SET deleted = 0, expires = NULL WHERE id = ?1", [id]);
+    }
+
+    /// Gone for good: the item and its files.
+    pub fn purge(&self, id: &str) {
+        if self.db.execute("DELETE FROM assets WHERE id = ?1", [id]).unwrap_or(0) > 0 {
+            let _ = self.db.execute_batch("PRAGMA incremental_vacuum;");
+        }
     }
 }
 
@@ -641,6 +716,8 @@ mod tests {
             resources,
             details: serde_json::Value::Null,
             edit: None,
+            deleted: false,
+            expires: None,
         }
     }
 
@@ -696,15 +773,19 @@ mod tests {
         store(&lib, "a", ORIGINAL, "1", &dir);
 
         // Deleted on the phone: in Recently Deleted, gone from the library listing.
-        let diff = lib.apply_scan(&[asset("b", "1")], &[], &["a".into()], "t2").unwrap();
+        let trashed = Trashed { id: "a".into(), expires: Some(1_900_000_000.0) };
+        let diff = lib.apply_scan(&[asset("b", "1")], &[], &[trashed], "t2").unwrap();
         assert_eq!((diff.deleted, diff.purged), (1, 0));
         assert_eq!(lib.assets().iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["b"]);
+        let deleted = lib.deleted_assets();
+        assert_eq!((deleted.len(), deleted[0].deleted, deleted[0].expires), (1, true, Some(1_900_000_000.0)));
         let db = connect(lib.path()).unwrap();
         assert!(read_blob(&db, "a", ORIGINAL).is_some(), "kept while in Recently Deleted");
 
         // Restored on the phone: visible again, file still there.
         lib.apply_scan(&[asset("a", "1"), asset("b", "1")], &[], &[], "t3").unwrap();
         assert_eq!(lib.assets().len(), 2);
+        assert!(lib.deleted_assets().is_empty() && lib.assets().iter().all(|a| a.expires.is_none()));
 
         // Deleted and then purged from Recently Deleted: gone, file and all.
         lib.apply_scan(&[asset("b", "1")], &[], &[], "t4").unwrap();
@@ -789,5 +870,28 @@ mod tests {
         assert_eq!(lib.pop_history("a"), Some(Some(first)));
         assert_eq!(lib.pop_history("a"), Some(None), "then back to the original");
         assert!(!lib.has_history("a"));
+    }
+
+    #[test]
+    fn delete_restore_and_purge_here() {
+        let (dir, mut lib) = setup();
+        lib.apply_scan(&[asset("a", "1"), asset("b", "1")], &[], &[], "t1").unwrap();
+        store(&lib, "a", ORIGINAL, "1", &dir);
+        let expires = lib.mark_deleted("a");
+        let now = gtk::glib::real_time() as f64 / 1e6;
+        assert!((expires - now - TRASH_DAYS * 86_400.0).abs() < 60.0);
+        assert_eq!(lib.deleted_assets()[0].expires, Some(expires));
+        lib.restore("a");
+        assert_eq!(lib.assets().len(), 2);
+        lib.mark_deleted("a");
+        lib.purge("a");
+        assert!(lib.deleted_assets().is_empty());
+        assert!(read_blob(&connect(lib.path()).unwrap(), "a", ORIGINAL).is_none());
+    }
+
+    #[test]
+    fn trashed_reads_ids_or_objects() {
+        let list: Vec<Trashed> = serde_json::from_str(r#"["a", {"id": "b", "expires": 5.0}, {"id": "c", "expires": null}]"#).unwrap();
+        assert_eq!(list, [Trashed::from("a"), Trashed { id: "b".into(), expires: Some(5.0) }, Trashed::from("c")]);
     }
 }

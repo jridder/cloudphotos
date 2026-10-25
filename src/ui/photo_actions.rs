@@ -314,6 +314,45 @@ pub fn confirm_delete(parent: &gtk::Widget, target: &Target, on_deleted: impl Fn
     dialog.present(Some(parent));
 }
 
+/// Bring it back from Recently Deleted; `on_done` runs once it's back
+/// (it has left the list the viewer was showing).
+pub fn recover(target: &Target, on_done: Rc<dyn Fn()>) {
+    let target = target.clone();
+    glib::spawn_future_local(async move {
+        if model().recover(&target.object).await {
+            on_done();
+            toast(&target.toasts, "Recovered.");
+        }
+    });
+}
+
+/// Ask, then remove it from Recently Deleted for good.
+pub fn confirm_delete_now(parent: &gtk::Widget, target: &Target, on_deleted: impl Fn() + 'static) {
+    let what = if target.object.with(|a| a.is_video()) { "Video" } else { "Photo" };
+    let dialog = adw::AlertDialog::builder()
+        .heading(format!("Delete This {what} Now?"))
+        .body("It will be removed from iCloud Photos on all your devices. This can't be undone.")
+        .build();
+    dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete Now")]);
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    let target = target.clone();
+    let on_deleted = Rc::new(on_deleted);
+    dialog.connect_response(None, move |_, response| {
+        if response != "delete" {
+            return;
+        }
+        let (target, on_deleted) = (target.clone(), on_deleted.clone());
+        glib::spawn_future_local(async move {
+            if model().delete_now(&target.object).await {
+                on_deleted();
+                toast(&target.toasts, "Deleted.");
+            }
+        });
+    });
+    dialog.present(Some(parent));
+}
+
 /// The right-click menu for `target`, at (x, y) in `anchor`. `open` adds
 /// an Open item (the grid); `on_deleted` runs after a delete.
 pub fn popup(anchor: &gtk::Widget, x: f64, y: f64, target: Target, open: Option<Rc<dyn Fn()>>, on_deleted: Rc<dyn Fn()>) {
@@ -325,22 +364,31 @@ pub fn popup(anchor: &gtk::Widget, x: f64, y: f64, target: Target, open: Option<
     if open.is_some() {
         first.append(Some("Open"), Some("photo.open"));
     }
-    first.append(Some(if target.object.favorite() { "Remove from Favorites" } else { "Add to Favorites" }), Some("photo.favorite"));
-    if !asset.is_video() {
-        first.append(Some("Edit"), Some("photo.edit"));
+    if asset.deleted {
+        // Recently Deleted: bring it back, or remove it for good.
+        first.append(Some("Recover"), Some("photo.recover"));
+        menu.append_section(None, &first);
+        let last = gio::Menu::new();
+        last.append(Some("Delete Now…"), Some("photo.delete-now"));
+        menu.append_section(None, &last);
+    } else {
+        first.append(Some(if target.object.favorite() { "Remove from Favorites" } else { "Add to Favorites" }), Some("photo.favorite"));
+        if !asset.is_video() {
+            first.append(Some("Edit"), Some("photo.edit"));
+        }
+        first.append(Some("Export…"), Some("photo.export"));
+        menu.append_section(None, &first);
+        if edited || model().can_undo_edit(&target.object) {
+            let edits = gio::Menu::new();
+            edits.append(Some("Undo Last Edit"), Some("photo.undo-edit"));
+            edits.append(Some("Revert to Original"), Some("photo.revert"));
+            edits.append(Some("Save Copy to iCloud"), Some("photo.save-copy"));
+            menu.append_section(None, &edits);
+        }
+        let last = gio::Menu::new();
+        last.append(Some("Delete…"), Some("photo.delete"));
+        menu.append_section(None, &last);
     }
-    first.append(Some("Export…"), Some("photo.export"));
-    menu.append_section(None, &first);
-    if edited || model().can_undo_edit(&target.object) {
-        let edits = gio::Menu::new();
-        edits.append(Some("Undo Last Edit"), Some("photo.undo-edit"));
-        edits.append(Some("Revert to Original"), Some("photo.revert"));
-        edits.append(Some("Save Copy to iCloud"), Some("photo.save-copy"));
-        menu.append_section(None, &edits);
-    }
-    let last = gio::Menu::new();
-    last.append(Some("Delete…"), Some("photo.delete"));
-    menu.append_section(None, &last);
 
     let popover = gtk::PopoverMenu::from_model(Some(&menu));
     popover.set_parent(anchor);
@@ -359,6 +407,13 @@ pub fn popup(anchor: &gtk::Widget, x: f64, y: f64, target: Target, open: Option<
     if let Some(open) = open {
         add("open", true, Box::new(move |_| open()));
     }
+    let done = on_deleted.clone();
+    add("recover", true, Box::new(move |t| recover(t, done.clone())));
+    let (a, done) = (anchor.clone(), on_deleted.clone());
+    add("delete-now", true, Box::new(move |t| {
+        let done = done.clone();
+        confirm_delete_now(&a, t, move || done());
+    }));
     add("favorite", true, Box::new(|t| set_favorite(&t.object, !t.object.favorite())));
     add("edit", true, Box::new(edit));
     let a = anchor.clone();

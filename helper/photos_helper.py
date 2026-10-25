@@ -14,11 +14,14 @@ app's Sign In Again.
 
 Methods:
   connect  {config, cookie_dir, session_dir}   -> {apple_id}
-  scan     {}                                  -> {sync_token}; emits "assets" and "albums"
+  scan     {}                                  -> {sync_token, recently_deleted: [{id, expires}]};
+                                                  emits "assets" and "albums"
   changed  {since}                             -> {changed: bool}
   urls     {ids: [...], masters: {id: master}} -> {id: {key: url}} with fresh download URLs
   favorite {id, master, value}                 -> {}
   delete   {id, master}                        -> {}   (moves to Recently Deleted)
+  recover  {id, master}                        -> {}   (back from Recently Deleted)
+  purge    {id, master}                        -> {}   (removed from Recently Deleted for good)
   upload   {path}                              -> {asset}  (a new photo, e.g. an edited copy)
 
 `--fake DIR` serves DIR/library.json instead, for tests and screenshots.
@@ -159,6 +162,29 @@ def asset_dict(asset):
     }
 
 
+def expiry(asset):
+    """When iCloud removes an item in Recently Deleted for good (Unix
+    seconds), from its record's expirationTime, if it has one."""
+    record = getattr(asset, "_asset_record", None)
+    value = record.get("expirationTime") if isinstance(record, dict) else getattr(record, "expirationTime", None)
+    if value is None:
+        return None
+    if hasattr(value, "timestamp"):
+        return value.timestamp()
+    value = float(value)
+    return value / 1000 if value > 1e11 else value
+
+
+def record_value(record, field):
+    """A field's value from a CKRecord or a raw record dict."""
+    if isinstance(record, dict):
+        return (record.get("fields", {}).get(field) or {}).get("value")
+    try:
+        return record.fields.get_value(field)
+    except (AttributeError, KeyError):
+        return None
+
+
 # ── iCloud ──────────────────────────────────────────────────────────────────
 
 class ICloudLibrary:
@@ -229,7 +255,7 @@ class ICloudLibrary:
                 continue
             if kind == "SmartPhotoAlbum" and album.name == DELETED_ALBUM:
                 # Kept locally until Apple purges them; mirrored away after.
-                recently_deleted = [a.id for a in album]
+                recently_deleted = [{"id": a.id, "expires": expiry(a)} for a in album]
                 continue
             if kind == "SmartPhotoAlbum":
                 if album.name not in SMART_ALBUMS:
@@ -311,6 +337,40 @@ class ICloudLibrary:
             raise HelperError("failed", "iCloud didn't accept the change.")
         return {}
 
+    def recover(self, params):
+        asset = self._asset(params["id"], params.get("master"))
+        self._set_flags(asset._asset_record, {"isDeleted": 0})
+        # iCloud marks the master deleted along with the asset; if it
+        # doesn't bring it back by itself, do so too.
+        fresh = self._asset(params["id"], params.get("master"))
+        if record_value(fresh._master_record, "isDeleted"):
+            self._set_flags(fresh._master_record, {"isDeleted": 0})
+        return {}
+
+    def purge(self, params):
+        asset = self._asset(params["id"], params.get("master"))
+        self._set_flags(asset._asset_record, {"isExpunged": 1})
+        return {}
+
+    def _set_flags(self, record, values):
+        """Set INT64 fields on one record. CloudKit's refusals raise."""
+        from pyicloud.common.cloudkit import CKModifyOperation, CKWriteRecord, CKZoneID, CKZoneIDReq
+        from pyicloud.services.photos_cloudkit import service as svc
+
+        zone = svc.record_zone(record) or svc.PRIMARY_ZONE
+        op = CKModifyOperation(
+            operationType="update",
+            record=CKWriteRecord(
+                recordName=svc.record_name(record),
+                recordType=svc.record_record_type(record),
+                recordChangeTag=svc._record_change_tag(record),
+                fields={k: {"type": "INT64", "value": v} for k, v in values.items()},
+                zoneID=CKZoneID(**zone),
+            ),
+        )
+        zone_id = CKZoneIDReq(zoneName=zone["zoneName"], ownerRecordName=zone.get("ownerRecordName"), zoneType=zone.get("zoneType"))
+        self._photos().private_client.modify(operations=[op], zone_id=zone_id, atomic=True)
+
     def upload(self, params):
         asset = self._photos().upload(params["path"])
         if asset is None:
@@ -375,6 +435,14 @@ class FakeLibrary:
         self._record("delete", params)
         return {}
 
+    def recover(self, params):
+        self._record("recover", params)
+        return {}
+
+    def purge(self, params):
+        self._record("purge", params)
+        return {}
+
     def upload(self, params):
         self._record("upload", params)
         path = params["path"]
@@ -392,7 +460,7 @@ class FakeLibrary:
 def main():
     fake = sys.argv[sys.argv.index("--fake") + 1] if "--fake" in sys.argv else None
     library = FakeLibrary(fake) if fake else ICloudLibrary()
-    methods = {name: getattr(library, name) for name in ("connect", "scan", "changed", "urls", "favorite", "delete", "upload")}
+    methods = {name: getattr(library, name) for name in ("connect", "scan", "changed", "urls", "favorite", "delete", "recover", "purge", "upload")}
     for line in sys.stdin:
         try:
             request = json.loads(line)

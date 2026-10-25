@@ -33,6 +33,17 @@ impl PhotoGrid {
             let heart = badge("cloudphotos-heart-filled-symbolic", gtk::Align::Start, gtk::Align::End);
             cell.add_overlay(&video);
             cell.add_overlay(&heart);
+            // Recently Deleted: days until iCloud removes it.
+            let days = gtk::Label::builder()
+                .halign(gtk::Align::End)
+                .valign(gtk::Align::End)
+                .margin_end(6)
+                .margin_bottom(6)
+                .visible(false)
+                .build();
+            days.add_css_class("days-left");
+            days.add_css_class("caption");
+            cell.add_overlay(&days);
             // The heart follows the item's favorite property, through rebinds.
             item.property_expression("item")
                 .chain_property::<AssetObject>("favorite")
@@ -46,6 +57,9 @@ impl PhotoGrid {
                 move || {
                     let (Some(item), Some(picture)) = (weak_item.upgrade(), weak_picture.upgrade()) else { return };
                     let Some(object) = item.item().and_downcast::<AssetObject>() else { return };
+                    if let Some(cell) = picture.parent().and_downcast::<gtk::Overlay>() {
+                        show_days_left(&cell, &object);
+                    }
                     if object.revision() == 0 {
                         return; // never edited; bind loads it
                     }
@@ -84,6 +98,7 @@ impl PhotoGrid {
             video.set_visible(object.with(|a| a.is_video()));
             let (filename, taken) = object.with(|a| (a.filename.clone(), a.taken));
             cell.set_tooltip_text(Some(&format!("{filename}\n{}", format_date(taken))));
+            show_days_left(&cell, &object);
 
             load_thumb(item, &picture, object);
         });
@@ -158,6 +173,31 @@ fn load_thumb(item: &gtk::ListItem, picture: &gtk::Picture, object: AssetObject)
             });
         }
     }
+}
+
+/// "29 days" on items in Recently Deleted; hidden otherwise.
+fn show_days_left(cell: &gtk::Overlay, object: &AssetObject) {
+    let mut child = cell.first_child();
+    while let Some(widget) = child {
+        if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            let text = object.with(|a| a.deleted.then(|| days_left(a.expires)).flatten());
+            label.set_visible(text.is_some());
+            label.set_label(text.as_deref().unwrap_or(""));
+            return;
+        }
+        child = widget.next_sibling();
+    }
+}
+
+/// How long until `expires` (Unix seconds), as iPhone's Recently Deleted puts it.
+pub fn days_left(expires: Option<f64>) -> Option<String> {
+    let now = glib::real_time() as f64 / 1e6;
+    let days = ((expires? - now) / 86_400.0).ceil().max(0.0) as i64;
+    Some(match days {
+        0 => "Today".into(),
+        1 => "1 day".into(),
+        n => format!("{n} days"),
+    })
 }
 
 fn badge(icon: &str, halign: gtk::Align, valign: gtk::Align) -> gtk::Image {

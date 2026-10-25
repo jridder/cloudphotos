@@ -48,7 +48,7 @@ pub enum Event {
 const BATCH: usize = 100;
 /// Bumped when scans start recording something new for existing items,
 /// so the next start rescans once to fill it in.
-const SCAN_VERSION: &str = "2";
+const SCAN_VERSION: &str = "3";
 
 pub struct Model {
     helper: RefCell<Option<Rc<Helper>>>,
@@ -56,6 +56,8 @@ pub struct Model {
     pub store: Rc<Store>,
     /// Every visible item, newest first.
     pub all: gio::ListStore,
+    /// Recently Deleted, the most recently deleted first.
+    pub trash: gio::ListStore,
     by_id: RefCell<HashMap<String, AssetObject>>,
     albums: RefCell<Vec<Album>>,
     state: RefCell<State>,
@@ -97,6 +99,7 @@ impl Model {
             store: Store::new(path, temp_dir()),
             library: RefCell::new(library),
             all: gio::ListStore::new::<AssetObject>(),
+            trash: gio::ListStore::new::<AssetObject>(),
             by_id: RefCell::default(),
             albums: RefCell::default(),
             state: RefCell::new(State::Starting),
@@ -213,7 +216,7 @@ impl Model {
                 let assets = std::mem::take(&mut *self.scan_assets.borrow_mut());
                 let albums = std::mem::take(&mut *self.scan_albums.borrow_mut());
                 let token = value.get("sync_token").and_then(Value::as_str).unwrap_or_default();
-                let trash: Vec<String> = value
+                let trash: Vec<library::Trashed> = value
                     .get("recently_deleted")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_default();
@@ -263,26 +266,30 @@ impl Model {
 
     /// Show what the library holds, keeping existing objects so open views stay attached.
     fn reload(&self) {
-        let (assets, albums) = {
+        let (assets, albums, deleted) = {
             let library = self.library.borrow();
-            (library.assets(), library.albums())
+            (library.assets(), library.albums(), library.deleted_assets())
         };
         let mut old = std::mem::take(&mut *self.by_id.borrow_mut());
-        let objects: Vec<AssetObject> = assets
-            .into_iter()
-            .map(|asset| match old.remove(&asset.id) {
-                Some(object) => {
-                    object.update(|a| *a = asset);
-                    object
-                }
-                None => AssetObject::new(asset),
-            })
-            .collect();
+        // Objects move between the library and Recently Deleted as they are.
+        for object in self.trash.iter::<AssetObject>().flatten() {
+            old.insert(object.id(), object);
+        }
+        let mut reuse = |asset: Asset| match old.remove(&asset.id) {
+            Some(object) => {
+                object.update(|a| *a = asset);
+                object
+            }
+            None => AssetObject::new(asset),
+        };
+        let trash: Vec<AssetObject> = deleted.into_iter().map(&mut reuse).collect();
+        let objects: Vec<AssetObject> = assets.into_iter().map(&mut reuse).collect();
         for id in old.keys() {
             self.store.forget(id);
         }
         self.by_id.replace(objects.iter().map(|o| (o.id(), o.clone())).collect());
         self.all.splice(0, self.all.n_items(), &objects);
+        self.trash.splice(0, self.trash.n_items(), &trash);
         self.albums.replace(albums);
         self.notify(Event::Albums);
     }
@@ -577,10 +584,67 @@ impl Model {
             self.notify(Event::Toast(format!("Couldn't delete: {}", e.message)));
             return false;
         }
-        self.library.borrow().mark_deleted(&id);
+        let expires = self.library.borrow().mark_deleted(&id);
         self.by_id.borrow_mut().remove(&id);
         if let Some(pos) = self.all.find(object) {
             self.all.remove(pos);
+        }
+        object.update(|a| {
+            a.deleted = true;
+            a.expires = Some(expires);
+        });
+        object.set_revision(object.revision() + 1);
+        self.trash.insert(0, object);
+        self.notify(Event::Albums);
+        true
+    }
+
+    /// Bring an item back from Recently Deleted, in iCloud and here.
+    pub async fn recover(self: &Rc<Self>, object: &AssetObject) -> bool {
+        let Some(helper) = self.helper.borrow().clone() else {
+            self.notify(Event::Toast("Couldn't recover: not connected to iCloud.".into()));
+            return false;
+        };
+        let (id, master) = (object.id(), object.with(|a| a.master.clone()));
+        if let Err(e) = helper.call("recover", json!({"id": id, "master": master})).await {
+            self.notify(Event::Toast(format!("Couldn't recover: {}", e.message)));
+            return false;
+        }
+        self.library.borrow().restore(&id);
+        if let Some(pos) = self.trash.find(object) {
+            self.trash.remove(pos);
+        }
+        object.update(|a| {
+            a.deleted = false;
+            a.expires = None;
+        });
+        object.set_revision(object.revision() + 1);
+        // Back in its place in the timeline (newest first).
+        let taken = object.with(|a| a.taken);
+        let position = (0..self.all.n_items())
+            .find(|&i| self.all.item(i).and_downcast::<AssetObject>().is_some_and(|o| o.with(|a| a.taken) < taken))
+            .unwrap_or(self.all.n_items());
+        self.all.insert(position, object);
+        self.by_id.borrow_mut().insert(id, object.clone());
+        self.notify(Event::Albums);
+        true
+    }
+
+    /// Remove an item from Recently Deleted for good, in iCloud and here.
+    pub async fn delete_now(self: &Rc<Self>, object: &AssetObject) -> bool {
+        let Some(helper) = self.helper.borrow().clone() else {
+            self.notify(Event::Toast("Couldn't delete: not connected to iCloud.".into()));
+            return false;
+        };
+        let (id, master) = (object.id(), object.with(|a| a.master.clone()));
+        if let Err(e) = helper.call("purge", json!({"id": id, "master": master})).await {
+            self.notify(Event::Toast(format!("Couldn't delete: {}", e.message)));
+            return false;
+        }
+        self.library.borrow().purge(&id);
+        self.store.forget(&id);
+        if let Some(pos) = self.trash.find(object) {
+            self.trash.remove(pos);
         }
         self.notify(Event::Albums);
         true

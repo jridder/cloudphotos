@@ -35,6 +35,10 @@ struct Viewer {
     loading: Cell<u64>,
     edit_button: gtk::Button,
     show_original: gtk::ToggleButton,
+    more: gtk::MenuButton,
+    delete_button: gtk::Button,
+    /// Shown for items in Recently Deleted.
+    recover: gtk::Button,
     actions: gio::SimpleActionGroup,
     /// The Live Photo clip already loaded for the current item, replayed on
     /// later clicks rather than fetched again.
@@ -62,6 +66,7 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
     more_menu.append(Some("Save Copy to iCloud"), Some("viewer.save-copy"));
     let more = gtk::MenuButton::builder().icon_name("view-more-symbolic").tooltip_text("More").menu_model(&more_menu).build();
     let delete = gtk::Button::builder().icon_name("user-trash-symbolic").tooltip_text("Delete").build();
+    let recover = gtk::Button::builder().label("Recover").tooltip_text("Recover").visible(false).build();
     let live = gtk::Button::builder().label("LIVE").tooltip_text("Play Live Photo").visible(false).build();
     live.add_css_class("live-button");
     header.pack_end(&more);
@@ -71,6 +76,7 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
     header.pack_end(&edit);
     header.pack_end(&show_original);
     header.pack_end(&favorite);
+    header.pack_end(&recover);
     header.pack_start(&live);
 
     let picture = gtk::Picture::builder().content_fit(gtk::ContentFit::Contain).can_shrink(true).build();
@@ -139,6 +145,9 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
         loading: Cell::new(0),
         edit_button: edit.clone(),
         show_original: show_original.clone(),
+        more: more.clone(),
+        delete_button: delete.clone(),
+        recover: recover.clone(),
         actions: gio::SimpleActionGroup::new(),
         live_media: RefCell::default(),
         live_pending: Cell::new(false),
@@ -195,6 +204,13 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
     });
     let v = viewer.clone();
     delete.connect_clicked(move |_| v.confirm_delete());
+    let v = viewer.clone();
+    recover.connect_clicked(move |_| {
+        if let Some(target) = v.target() {
+            let this = v.clone();
+            photo_actions::recover(&target, Rc::new(move || this.after_delete()));
+        }
+    });
 
     // Keyboard: arrows step, Escape closes.
     let keys = gtk::EventControllerKey::new();
@@ -302,9 +318,14 @@ impl Viewer {
         self.title.set_subtitle(&format_date(asset.taken));
         self.page.set_title(&asset.filename);
         self.live.set_visible(asset.live && asset.resources.contains_key(LIVE));
-        self.edit_button.set_visible(!asset.is_video());
+        // Items in Recently Deleted can be recovered or deleted for good.
+        self.edit_button.set_visible(!asset.is_video() && !asset.deleted);
         self.show_original.set_active(false);
-        self.show_original.set_visible(asset.edit.is_some());
+        self.show_original.set_visible(asset.edit.is_some() && !asset.deleted);
+        self.favorite.set_visible(!asset.deleted);
+        self.more.set_visible(!asset.deleted);
+        self.recover.set_visible(asset.deleted);
+        self.delete_button.set_tooltip_text(Some(if asset.deleted { "Delete Now" } else { "Delete" }));
         let can_undo = model().can_undo_edit(&object);
         for (name, enabled) in [("save-copy", asset.edit.is_some()), ("revert", asset.edit.is_some()), ("undo-edit", can_undo)] {
             if let Some(action) = self.actions.lookup_action(name).and_downcast::<gio::SimpleAction>() {
@@ -501,6 +522,10 @@ impl Viewer {
     fn confirm_delete(self: &Rc<Self>) {
         let Some(target) = self.target() else { return };
         let this = self.clone();
+        if target.object.with(|a| a.deleted) {
+            photo_actions::confirm_delete_now(self.page.upcast_ref(), &target, move || this.after_delete());
+            return;
+        }
         photo_actions::confirm_delete(self.page.upcast_ref(), &target, move || this.after_delete());
     }
 
