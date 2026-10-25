@@ -5,6 +5,7 @@ use std::{
     cell::{Cell, OnceCell, RefCell},
     collections::HashMap,
     rc::Rc,
+    time::Duration,
 };
 
 use gtk::{gdk, gio, glib, prelude::*};
@@ -63,6 +64,10 @@ pub struct Model {
     state: RefCell<State>,
     scanning: Cell<bool>,
     syncing: Cell<bool>,
+    /// Asking iCloud what changed (see `catch_up`).
+    checking: Cell<bool>,
+    /// When iCloud was last asked (monotonic µs).
+    last_check: Cell<i64>,
     scan_assets: RefCell<Vec<Asset>>,
     scan_albums: RefCell<Vec<Album>>,
     listeners: RefCell<Vec<Rc<dyn Fn(&Event)>>>,
@@ -105,6 +110,8 @@ impl Model {
             state: RefCell::new(State::Starting),
             scanning: Cell::new(false),
             syncing: Cell::new(false),
+            checking: Cell::new(false),
+            last_check: Cell::new(0),
             scan_assets: RefCell::default(),
             scan_albums: RefCell::default(),
             listeners: RefCell::default(),
@@ -178,28 +185,100 @@ impl Model {
             return self.set_state(state_for(e));
         }
         self.set_state(State::Ready);
-        let since = self.library.borrow().meta("sync_token");
-        let changed = match helper.call("changed", json!({"since": since})).await {
-            Ok(v) => v.get("changed").and_then(Value::as_bool).unwrap_or(true),
-            Err(_) => true,
-        };
         let outdated = self.library.borrow().meta("scan_version").as_deref() != Some(SCAN_VERSION);
-        if changed || outdated || self.all.n_items() == 0 {
+        if outdated || self.all.n_items() == 0 {
             self.scan().await;
+        } else {
+            self.catch_up().await;
         }
+        self.watch();
         self.sync().await;
     }
 
     /// Check iCloud for changes now (the refresh button).
     pub fn refresh(self: &Rc<Self>) {
-        if self.scanning.get() || self.state() != State::Ready {
+        self.check_for_changes(Duration::ZERO);
+    }
+
+    /// Keep up with changes made elsewhere (deleted on the iPhone, say) by
+    /// asking iCloud every couple of minutes while the app is open.
+    fn watch(self: &Rc<Self>) {
+        let seconds = std::env::var("CLOUDPHOTOS_POLL_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_seconds_local(seconds, move || {
+            let Some(model) = weak.upgrade() else { return glib::ControlFlow::Break };
+            model.check_for_changes(Duration::ZERO);
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// Catch up with iCloud, unless it was asked within `unless_within`
+    /// (coming back to the window shouldn't ask every time), then download
+    /// whatever is new.
+    pub fn check_for_changes(self: &Rc<Self>, unless_within: Duration) {
+        let since_last = glib::monotonic_time() - self.last_check.get();
+        if self.scanning.get() || self.checking.get() || self.state() != State::Ready || since_last < unless_within.as_micros() as i64 {
             return;
         }
         let this = self.clone();
         glib::spawn_future_local(async move {
-            this.scan().await;
-            this.sync().await;
+            if this.catch_up().await {
+                this.sync().await;
+            }
         });
+    }
+
+    /// Ask iCloud what changed since the last look and merge it: one small
+    /// request when nothing did. Album changes (or an expired sync token)
+    /// mean a full scan. Returns whether anything changed.
+    async fn catch_up(self: &Rc<Self>) -> bool {
+        let Some(helper) = self.helper.borrow().clone() else { return false };
+        let since = self.library.borrow().meta("sync_token");
+        if since.is_none() {
+            self.scan().await;
+            return true;
+        }
+        self.checking.set(true);
+        self.last_check.set(glib::monotonic_time());
+        let result = helper.call("changes", json!({"since": since})).await;
+        self.checking.set(false);
+        let value = match result {
+            Ok(value) => value,
+            Err(e) if matches!(e.code.as_str(), "needs_signin" | "not_connected") => {
+                self.set_state(state_for(e));
+                return false;
+            }
+            Err(e) => {
+                eprintln!("cloudphotos: checking for changes failed: {}", e.message);
+                return false;
+            }
+        };
+        let flag = |key: &str| value.get(key).and_then(Value::as_bool).unwrap_or(false);
+        if flag("full_scan") || flag("albums_changed") {
+            self.scan().await;
+            return true;
+        }
+        fn list<T: serde::de::DeserializeOwned>(value: &Value, key: &str) -> Vec<T> {
+            value.get(key).and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default()
+        }
+        let assets: Vec<Asset> = list(&value, "assets");
+        let trashed: Vec<library::Trashed> = list(&value, "trashed");
+        let removed: Vec<String> = list(&value, "removed");
+        let token = value.get("sync_token").and_then(Value::as_str).unwrap_or_default();
+        let nothing = assets.is_empty() && trashed.is_empty() && removed.is_empty();
+        let result = self.library.borrow_mut().apply_changes(&assets, &trashed, &removed, token);
+        match result {
+            Ok(diff) if !nothing => {
+                eprintln!("cloudphotos: changes {diff:?}, {} updated", assets.len());
+                self.reload();
+                true
+            }
+            Ok(_) => false,
+            Err(e) => {
+                self.notify(Event::Toast(format!("Couldn't update the library: {e}")));
+                false
+            }
+        }
     }
 
     /// List the whole library from iCloud and merge it into the local one.
@@ -288,8 +367,8 @@ impl Model {
             self.store.forget(id);
         }
         self.by_id.replace(objects.iter().map(|o| (o.id(), o.clone())).collect());
-        self.all.splice(0, self.all.n_items(), &objects);
-        self.trash.splice(0, self.trash.n_items(), &trash);
+        replace_items(&self.all, &objects);
+        replace_items(&self.trash, &trash);
         self.albums.replace(albums);
         self.notify(Event::Albums);
     }
@@ -648,6 +727,33 @@ impl Model {
         }
         self.notify(Event::Albums);
         true
+    }
+}
+
+/// Make `store` hold `objects`, in order, by removing, inserting and
+/// moving only what differs, so views keep their place (and scroll
+/// position) when a few items change.
+pub fn replace_items(store: &gio::ListStore, objects: &[AssetObject]) {
+    if store.n_items() == 0 {
+        store.splice(0, 0, objects);
+        return;
+    }
+    let wanted: std::collections::HashSet<String> = objects.iter().map(AssetObject::id).collect();
+    for i in (0..store.n_items()).rev() {
+        if store.item(i).and_downcast::<AssetObject>().is_none_or(|o| !wanted.contains(&o.id())) {
+            store.remove(i);
+        }
+    }
+    for (i, object) in objects.iter().enumerate() {
+        let i = i as u32;
+        if store.item(i).and_downcast_ref::<AssetObject>() == Some(object) {
+            continue;
+        }
+        // Moved (its date changed): take it out of its old place first.
+        if let Some(j) = (i + 1..store.n_items()).find(|&j| store.item(j).and_downcast_ref::<AssetObject>() == Some(object)) {
+            store.remove(j);
+        }
+        store.insert(i, object);
     }
 }
 

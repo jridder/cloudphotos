@@ -401,57 +401,8 @@ impl Library {
     pub fn apply_scan(&mut self, assets: &[Asset], albums: &[Album], recently_deleted: &[Trashed], sync_token: &str) -> rusqlite::Result<Diff> {
         let mut diff = Diff::default();
         let tx = self.db.transaction()?;
-        let existing: HashMap<String, (Option<String>, i64)> = {
-            let mut stmt = tx.prepare(
-                "SELECT a.id, (SELECT checksum FROM resources WHERE asset_id = a.id AND kind = 'original'), a.deleted FROM assets a",
-            )?;
-            stmt.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?.flatten().collect()
-        };
-        {
-            let mut upsert = tx.prepare(
-                "INSERT INTO assets (id, master, filename, kind, taken, added, width, height, size, live, favorite, deleted, details)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)
-                 ON CONFLICT (id) DO UPDATE SET master = ?2, filename = ?3, kind = ?4, taken = ?5, added = ?6,
-                     width = ?7, height = ?8, size = ?9, live = ?10, favorite = ?11, deleted = 0, expires = NULL, details = ?12",
-            )?;
-            let mut clear = tx.prepare("DELETE FROM resources WHERE asset_id = ?1")?;
-            let mut resource = tx.prepare(
-                "INSERT INTO resources (asset_id, kind, size, width, height, uti, checksum) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )?;
-            for a in assets {
-                let original = a.resources.get(ORIGINAL).and_then(|r| r.checksum.clone());
-                match existing.get(&a.id) {
-                    None => diff.added += 1,
-                    Some((old, _)) if *old != original => diff.updated += 1,
-                    _ => {}
-                }
-                let details = (!a.details.is_null()).then(|| a.details.to_string());
-                upsert.execute(params![
-                    a.id, a.master, a.filename, a.kind, a.taken, a.added, a.width, a.height, a.size, a.live as i64, a.favorite as i64,
-                    details
-                ])?;
-                if diff_changed(&existing, a, &original) {
-                    // A new original (edited on another device) means new
-                    // EXIF, and a local edit made against the old one no
-                    // longer fits.
-                    tx.execute("UPDATE assets SET exif = NULL WHERE id = ?1", [&a.id])?;
-                    // Keep the edit: it goes into the history, so Undo Last
-                    // Edit can bring it back onto the new original.
-                    tx.execute(
-                        "INSERT INTO edit_history (asset_id, pos, recipe, saved)
-                         SELECT asset_id, (SELECT COALESCE(MAX(pos), 0) + 1 FROM edit_history WHERE asset_id = ?1), recipe, saved
-                         FROM edits WHERE asset_id = ?1",
-                        [&a.id],
-                    )?;
-                    tx.execute("DELETE FROM edits WHERE asset_id = ?1", [&a.id])?;
-                    tx.execute("DELETE FROM blobs WHERE asset_id = ?1 AND kind IN ('edited_thumb', 'edited_preview')", [&a.id])?;
-                }
-                clear.execute([&a.id])?;
-                for (kind, r) in &a.resources {
-                    resource.execute(params![a.id, kind, r.size, r.width, r.height, r.kind, r.checksum])?;
-                }
-            }
-        }
+        let existing = existing_assets(&tx)?;
+        upsert_assets(&tx, assets, &existing, &mut diff)?;
         let listed: std::collections::HashSet<&str> = assets.iter().map(|a| a.id.as_str()).collect();
         let in_trash: HashMap<&str, Option<f64>> = recently_deleted.iter().map(|t| (t.id.as_str(), t.expires)).collect();
         for id in existing.keys().filter(|id| !listed.contains(id.as_str())) {
@@ -484,6 +435,33 @@ impl Library {
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('scanned_at', ?1)",
             [gtk::glib::real_time().to_string()],
         )?;
+        tx.commit()?;
+        if diff.purged > 0 {
+            let _ = self.db.execute_batch("PRAGMA incremental_vacuum;");
+        }
+        Ok(diff)
+    }
+
+    /// Merge what changed in iCloud since the last sync token: items added
+    /// or edited (or back from Recently Deleted), moved to Recently Deleted,
+    /// or removed for good.
+    pub fn apply_changes(&mut self, assets: &[Asset], trashed: &[Trashed], removed: &[String], sync_token: &str) -> rusqlite::Result<Diff> {
+        let mut diff = Diff::default();
+        let tx = self.db.transaction()?;
+        let existing = existing_assets(&tx)?;
+        upsert_assets(&tx, assets, &existing, &mut diff)?;
+        for item in trashed.iter().filter(|t| existing.contains_key(&t.id)) {
+            if tx.execute("UPDATE assets SET deleted = 1 WHERE id = ?1 AND deleted = 0", [&item.id])? > 0 {
+                diff.deleted += 1;
+            }
+            if let Some(expires) = item.expires {
+                tx.execute("UPDATE assets SET expires = ?2 WHERE id = ?1", params![item.id, expires])?;
+            }
+        }
+        for id in removed {
+            diff.purged += tx.execute("DELETE FROM assets WHERE id = ?1", [id])?;
+        }
+        tx.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('sync_token', ?1)", [sync_token])?;
         tx.commit()?;
         if diff.purged > 0 {
             let _ = self.db.execute_batch("PRAGMA incremental_vacuum;");
@@ -590,6 +568,68 @@ impl Library {
             let _ = self.db.execute_batch("PRAGMA incremental_vacuum;");
         }
     }
+}
+
+/// Every stored item: its original's checksum, and whether it's deleted.
+fn existing_assets(tx: &rusqlite::Transaction) -> rusqlite::Result<HashMap<String, (Option<String>, i64)>> {
+    let mut stmt = tx.prepare(
+        "SELECT a.id, (SELECT checksum FROM resources WHERE asset_id = a.id AND kind = 'original'), a.deleted FROM assets a",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?.flatten().collect();
+    Ok(rows)
+}
+
+/// Insert or update `assets` and their resources, counting them in `diff`.
+fn upsert_assets(
+    tx: &rusqlite::Transaction,
+    assets: &[Asset],
+    existing: &HashMap<String, (Option<String>, i64)>,
+    diff: &mut Diff,
+) -> rusqlite::Result<()> {
+    let mut upsert = tx.prepare(
+        "INSERT INTO assets (id, master, filename, kind, taken, added, width, height, size, live, favorite, deleted, details)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)
+         ON CONFLICT (id) DO UPDATE SET master = ?2, filename = ?3, kind = ?4, taken = ?5, added = ?6,
+             width = ?7, height = ?8, size = ?9, live = ?10, favorite = ?11, deleted = 0, expires = NULL, details = ?12",
+    )?;
+    let mut clear = tx.prepare("DELETE FROM resources WHERE asset_id = ?1")?;
+    let mut resource = tx.prepare(
+        "INSERT INTO resources (asset_id, kind, size, width, height, uti, checksum) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for a in assets {
+        let original = a.resources.get(ORIGINAL).and_then(|r| r.checksum.clone());
+        match existing.get(&a.id) {
+            None => diff.added += 1,
+            Some((old, _)) if *old != original => diff.updated += 1,
+            _ => {}
+        }
+        let details = (!a.details.is_null()).then(|| a.details.to_string());
+        upsert.execute(params![
+            a.id, a.master, a.filename, a.kind, a.taken, a.added, a.width, a.height, a.size, a.live as i64, a.favorite as i64,
+            details
+        ])?;
+        if diff_changed(&existing, a, &original) {
+            // A new original (edited on another device) means new
+            // EXIF, and a local edit made against the old one no
+            // longer fits.
+            tx.execute("UPDATE assets SET exif = NULL WHERE id = ?1", [&a.id])?;
+            // Keep the edit: it goes into the history, so Undo Last
+            // Edit can bring it back onto the new original.
+            tx.execute(
+                "INSERT INTO edit_history (asset_id, pos, recipe, saved)
+                 SELECT asset_id, (SELECT COALESCE(MAX(pos), 0) + 1 FROM edit_history WHERE asset_id = ?1), recipe, saved
+                 FROM edits WHERE asset_id = ?1",
+                [&a.id],
+            )?;
+            tx.execute("DELETE FROM edits WHERE asset_id = ?1", [&a.id])?;
+            tx.execute("DELETE FROM blobs WHERE asset_id = ?1 AND kind IN ('edited_thumb', 'edited_preview')", [&a.id])?;
+        }
+        clear.execute([&a.id])?;
+        for (kind, r) in &a.resources {
+            resource.execute(params![a.id, kind, r.size, r.width, r.height, r.kind, r.checksum])?;
+        }
+    }
+    Ok(())
 }
 
 fn diff_changed(existing: &HashMap<String, (Option<String>, i64)>, asset: &Asset, original: &Option<String>) -> bool {
@@ -893,5 +933,28 @@ mod tests {
     fn trashed_reads_ids_or_objects() {
         let list: Vec<Trashed> = serde_json::from_str(r#"["a", {"id": "b", "expires": 5.0}, {"id": "c", "expires": null}]"#).unwrap();
         assert_eq!(list, [Trashed::from("a"), Trashed { id: "b".into(), expires: Some(5.0) }, Trashed::from("c")]);
+    }
+
+    #[test]
+    fn changes_add_trash_restore_and_remove() {
+        let (dir, mut lib) = setup();
+        lib.apply_scan(&[asset("a", "1"), asset("b", "1"), asset("c", "1")], &[], &[], "t1").unwrap();
+        store(&lib, "b", ORIGINAL, "1", &dir);
+
+        // New "d", "b" deleted on the phone, "c" removed for good, plus a
+        // trashed item never seen here (ignored).
+        let trashed = [Trashed { id: "b".into(), expires: Some(1_900_000_000.0) }, Trashed::from("zzz")];
+        let diff = lib.apply_changes(&[asset("d", "1")], &trashed, &["c".into()], "t2").unwrap();
+        assert_eq!((diff.added, diff.deleted, diff.purged), (1, 1, 1));
+        let ids = |v: Vec<Asset>| v.into_iter().map(|a| a.id).collect::<Vec<_>>();
+        assert_eq!(ids(lib.assets()), ["a", "d"]);
+        assert_eq!(ids(lib.deleted_assets()), ["b"]);
+        assert_eq!(lib.meta("sync_token").as_deref(), Some("t2"));
+        assert!(read_blob(&connect(lib.path()).unwrap(), "b", ORIGINAL).is_some(), "kept while in Recently Deleted");
+
+        // Recovered on the phone: it comes back as a changed asset.
+        lib.apply_changes(&[asset("b", "1")], &[], &[], "t3").unwrap();
+        assert_eq!(ids(lib.assets()), ["a", "b", "d"]);
+        assert!(lib.deleted_assets().is_empty());
     }
 }

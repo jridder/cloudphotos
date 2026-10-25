@@ -52,6 +52,15 @@ pub fn run(window: adw::ApplicationWindow) {
                         }
                     }
                 }
+                "scroll" => {
+                    // scroll Y: scroll the grid to Y; "scroll" alone prints where it is.
+                    if let Some(scroller) = find::<gtk::GridView>(window.upcast_ref()).and_then(|g| g.parent()).and_downcast::<gtk::ScrolledWindow>() {
+                        match arg.parse::<f64>() {
+                            Ok(y) => scroller.vadjustment().set_value(y),
+                            Err(_) => eprintln!("CLOUDPHOTOS_SCRIPT: scrolled to {}", scroller.vadjustment().value()),
+                        }
+                    }
+                }
                 "menuitem" => {
                     // menuitem NAME: choose photo.NAME in the open menu.
                     if let Some(menu) = find::<gtk::PopoverMenu>(window.upcast_ref()) {

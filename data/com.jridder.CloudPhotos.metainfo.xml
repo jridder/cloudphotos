@@ -33,6 +33,11 @@
     <display_length compare="ge">768</display_length>
   </requires>
   <releases>
+    <release version="0.1.2" date="2026-10-25">
+      <description>
+        <p>Changes made on other devices (deletes, new photos, favorites, recovered items) show up within a couple of minutes, or as soon as you return to the window, without rescanning the whole library. The grid keeps its place when they arrive.</p>
+      </description>
+    </release>
     <release version="0.1.1" date="2026-10-24">
       <description>
         <p>Recently Deleted: deleted photos and videos, with the days left before iCloud removes them, to recover or delete for good.</p>

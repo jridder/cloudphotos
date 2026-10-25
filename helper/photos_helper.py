@@ -16,7 +16,8 @@ Methods:
   connect  {config, cookie_dir, session_dir}   -> {apple_id}
   scan     {}                                  -> {sync_token, recently_deleted: [{id, expires}]};
                                                   emits "assets" and "albums"
-  changed  {since}                             -> {changed: bool}
+  changes  {since}                             -> {sync_token, assets, trashed: [{id, expires}], removed: [id],
+                                                  albums_changed} since the token, or {full_scan: true}
   urls     {ids: [...], masters: {id: master}} -> {id: {key: url}} with fresh download URLs
   favorite {id, master, value}                 -> {}
   delete   {id, master}                        -> {}   (moves to Recently Deleted)
@@ -268,13 +269,71 @@ class ICloudLibrary:
         emit({"event": "albums", "albums": albums})
         return {"sync_token": token, "recently_deleted": recently_deleted}
 
-    def changed(self, params):
+    def changes(self, params):
+        """What changed in iCloud since `since` (a sync token): items added
+        or edited, moved to or out of Recently Deleted, or gone for good.
+        Album changes are only flagged; the app rescans for those."""
         since = params.get("since")
         if not since:
-            return {"changed": True}
-        for _event in self._photos().iter_changes(since=since):
-            return {"changed": True}
-        return {"changed": False}
+            return {"full_scan": True}
+        changed, gone, albums_changed = [], set(), False
+        try:
+            records, token = self._zone_changes(since)
+        except Exception as exc:
+            # An expired token, say: start over with a full listing.
+            return {"full_scan": True, "reason": str(exc)}
+        for record in records:
+            name, kind = record.get("recordName"), record.get("recordType")
+            if not name or record.get("serverErrorCode"):
+                continue
+            if record.get("deleted"):
+                gone.add(name)  # a tombstone: removed for good
+            elif kind == "CPLAsset":
+                if name not in changed:
+                    changed.append(name)
+            elif kind in ("CPLAlbum", "CPLContainerRelation"):
+                albums_changed = True
+
+        assets, trashed = [], []
+        for start in range(0, len(changed), BATCH):
+            ids = changed[start:start + BATCH]
+            found = self._lookup(ids, {})
+            for asset_id in ids:
+                asset = found.get(asset_id)
+                record = getattr(asset, "_asset_record", None)
+                if asset is None or record_value(record, "isHidden"):
+                    gone.add(asset_id)  # hidden items aren't part of the library
+                elif record_value(record, "isDeleted"):
+                    trashed.append({"id": asset_id, "expires": expiry(asset)})
+                else:
+                    item = asset_dict(asset)
+                    if item is not None:
+                        assets.append(item)
+        return {"sync_token": token, "assets": assets, "trashed": trashed,
+                "removed": sorted(gone), "albums_changed": albums_changed}
+
+    def _zone_changes(self, since):
+        """The photo library's records changed since `since` (raw CloudKit
+        JSON: name, type, deleted) and the new sync token. pyicloud's
+        iter_changes validates the reply against its models, which some real
+        libraries' replies fail, so this reads the JSON directly."""
+        from pyicloud.services.photos_cloudkit.constants import PRIMARY_ZONE
+
+        http = self._photos().private_client._client._http
+        token, records = since, []
+        while True:
+            data = http.post("/changes/zone", {"zones": [{"zoneID": dict(PRIMARY_ZONE), "syncToken": token, "desiredKeys": ["isDeleted"]}]})
+            zones = data.get("zones") or []
+            if not zones:
+                break
+            zone = zones[0]
+            if zone.get("serverErrorCode"):
+                raise RuntimeError(f"{zone['serverErrorCode']}: {zone.get('reason', '')}")
+            records.extend(zone.get("records") or [])
+            token = zone.get("syncToken") or token
+            if not zone.get("moreComing"):
+                break
+        return records, token
 
     def _asset(self, asset_id, master=None):
         """The current record for one item, for changing it: looked up fresh
@@ -418,9 +477,18 @@ class FakeLibrary:
         return {"sync_token": library.get("sync_token", "fake-1"),
                 "recently_deleted": library.get("recently_deleted", [])}
 
-    def changed(self, params):
-        self._record("changed", params)
-        return {"changed": params.get("since") != self._library().get("sync_token", "fake-1")}
+    def changes(self, params):
+        """library.json's "changes" (assets/trashed/removed/albums_changed)
+        once its sync_token differs from `since`; nothing otherwise."""
+        self._record("changes", params)
+        library = self._library()
+        token = library.get("sync_token", "fake-1")
+        if params.get("since") == token:
+            return {"sync_token": token, "assets": [], "trashed": [], "removed": [], "albums_changed": False}
+        if "changes" not in library:
+            return {"full_scan": True}
+        return {"sync_token": token, "assets": [], "trashed": [], "removed": [], "albums_changed": False,
+                **library["changes"]}
 
     def urls(self, params):
         self._record("urls", params)
@@ -460,7 +528,7 @@ class FakeLibrary:
 def main():
     fake = sys.argv[sys.argv.index("--fake") + 1] if "--fake" in sys.argv else None
     library = FakeLibrary(fake) if fake else ICloudLibrary()
-    methods = {name: getattr(library, name) for name in ("connect", "scan", "changed", "urls", "favorite", "delete", "recover", "purge", "upload")}
+    methods = {name: getattr(library, name) for name in ("connect", "scan", "changes", "urls", "favorite", "delete", "recover", "purge", "upload")}
     for line in sys.stdin:
         try:
             request = json.loads(line)

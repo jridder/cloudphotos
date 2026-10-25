@@ -181,6 +181,13 @@ pub fn build(app: &adw::Application) -> Rc<Window> {
         }
     });
     win.refresh.connect_clicked(|_| model().refresh());
+    // Coming back to the window: catch up with changes made elsewhere (at
+    // most every 30 seconds).
+    win.window.connect_is_active_notify(|w| {
+        if w.is_active() {
+            model().check_for_changes(std::time::Duration::from_secs(30));
+        }
+    });
 
     let weak = Rc::downgrade(&win);
     model().subscribe(move |event| {
@@ -262,10 +269,20 @@ impl Window {
     }
 
     fn show(&self, collection: Collection) {
-        // Leave the viewer (or editor) for the newly chosen collection's grid.
-        if self.current.borrow().clone() != collection {
-            self.nav.pop_to_tag("grid");
+        // The same collection again (the library changed): update what's
+        // shown in place, so the grid keeps its scroll position.
+        let current = self.items.borrow().clone();
+        if let (true, Some(current)) = (*self.current.borrow() == collection, current) {
+            if let (Some(store), Collection::Album(..)) = (current.downcast_ref::<gio::ListStore>(), &collection) {
+                let fresh = collection.items();
+                let objects: Vec<AssetObject> = fresh.iter::<AssetObject>().flatten().collect();
+                crate::model::replace_items(store, &objects);
+            }
+            self.update_state();
+            return;
         }
+        // Leave the viewer (or editor) for the newly chosen collection's grid.
+        self.nav.pop_to_tag("grid");
         let items = collection.items();
         self.grid.set_model(&items);
         self.title.set_title(&collection.title());
