@@ -48,7 +48,7 @@ pub enum Event {
 const BATCH: usize = 100;
 /// Bumped when scans start recording something new for existing items,
 /// so the next start rescans once to fill it in.
-const SCAN_VERSION: &str = "3";
+const SCAN_VERSION: &str = "4";
 
 pub struct Model {
     helper: RefCell<Option<Rc<Helper>>>,

@@ -164,9 +164,9 @@ def asset_dict(asset):
 
 def expiry(asset):
     """When iCloud removes an item in Recently Deleted for good (Unix
-    seconds), from its record's expirationTime, if it has one."""
-    record = getattr(asset, "_asset_record", None)
-    value = record.get("expirationTime") if isinstance(record, dict) else getattr(record, "expirationTime", None)
+    seconds): its dateExpunged, which iCloud sets 30 days after the delete.
+    (The record's expirationTime is a later, internal cleanup date.)"""
+    value = record_value(getattr(asset, "_asset_record", None), "dateExpunged")
     if value is None:
         return None
     if hasattr(value, "timestamp"):
