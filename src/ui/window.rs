@@ -7,8 +7,8 @@ use gtk::{gio, glib};
 
 use crate::{
     asset_object::AssetObject,
-    model::{Event, State, model},
-    ui::{grid::PhotoGrid, photo_actions, viewer},
+    model::{Event, OWN_SIGNIN, State, model},
+    ui::{grid::PhotoGrid, photo_actions, signin, viewer},
 };
 
 /// What the sidebar can show.
@@ -132,6 +132,11 @@ pub fn build(app: &adw::Application) -> Rc<Window> {
         )
     };
     let status = adw::StatusPage::new();
+    // Signing in from the app (OWN_SIGNIN); shown when it's needed.
+    let sign_in = gtk::Button::builder().label("Sign In…").halign(gtk::Align::Center).visible(false).build();
+    sign_in.add_css_class("suggested-action");
+    sign_in.add_css_class("pill");
+    status.set_child(Some(&sign_in));
     let stack = gtk::Stack::new();
     stack.add_named(&grid.root, Some("grid"));
     stack.add_named(&status, Some("status"));
@@ -181,6 +186,12 @@ pub fn build(app: &adw::Application) -> Rc<Window> {
         }
     });
     win.refresh.connect_clicked(|_| model().refresh());
+    let weak = Rc::downgrade(&win);
+    sign_in.connect_clicked(move |_| {
+        if let Some(win) = weak.upgrade() {
+            signin::present(&win.window);
+        }
+    });
     // Coming back to the window: catch up with changes made elsewhere (at
     // most every 30 seconds).
     win.window.connect_is_active_notify(|w| {
@@ -309,7 +320,13 @@ impl Window {
         let empty = self.items.borrow().as_ref().is_none_or(|i| i.n_items() == 0);
         self.refresh.set_sensitive(state == State::Ready && !model().is_scanning());
         let page = match (&state, empty) {
+            (State::NeedsSetup(message), _) if OWN_SIGNIN => Some(("Sign In to iCloud", "dialog-password-symbolic", message.clone())),
             (State::NeedsSetup(message), _) => Some(("Set Up iCloud Drive First", "dialog-information-symbolic", message.clone())),
+            (State::NeedsSignin(_), true) if OWN_SIGNIN => Some((
+                "Sign In Again",
+                "dialog-password-symbolic",
+                "Your iCloud session has expired. The photos already on this computer stay.".into(),
+            )),
             (State::NeedsSignin(_), true) => Some((
                 "Sign In Again",
                 "dialog-password-symbolic",
@@ -335,8 +352,21 @@ impl Window {
             }
             None => self.stack.set_visible_child_name("grid"),
         }
+        let needs_signin = matches!(state, State::NeedsSetup(_) | State::NeedsSignin(_));
+        if let Some(button) = self.status.child() {
+            button.set_visible(OWN_SIGNIN && needs_signin);
+        }
         if let State::NeedsSignin(_) = state {
-            if !empty {
+            if !empty && OWN_SIGNIN {
+                let toast = adw::Toast::builder().title("iCloud needs you to sign in again.").button_label("Sign In…").timeout(10).build();
+                let window = self.window.downgrade();
+                toast.connect_button_clicked(move |_| {
+                    if let Some(window) = window.upgrade() {
+                        signin::present(&window);
+                    }
+                });
+                self.toasts.add_toast(toast);
+            } else if !empty {
                 self.toast("iCloud needs you to sign in again — use Sign In Again in the iCloud Drive app.");
             }
         }

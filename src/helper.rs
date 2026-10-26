@@ -36,27 +36,67 @@ pub struct Helper {
 }
 
 /// Where the helper script and its Python live: overridable for tests and
-/// development, otherwise the Flatpak's bundled copy.
+/// development, otherwise the Flatpak's (or Windows bundle's) copy.
 fn helper_command() -> Command {
-    let script = std::env::var_os("CLOUDPHOTOS_HELPER").map(PathBuf::from).unwrap_or_else(|| {
-        let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("helper/photos_helper.py");
-        if std::path::Path::new("/.flatpak-info").exists() || !dev.exists() {
-            PathBuf::from("/app/libexec/cloudphotos/photos_helper.py")
-        } else {
-            dev
-        }
-    });
-    let python = std::env::var_os("CLOUDPHOTOS_PYTHON").map(PathBuf::from).unwrap_or_else(|| {
-        // Outside the Flatpak, pyicloud comes from icloud-linux's venv.
-        let venv = glib::home_dir().join(".local/share/icloud-linux/.venv/bin/python");
-        if !std::path::Path::new("/.flatpak-info").exists() && venv.exists() { venv } else { "python3".into() }
-    });
+    let script = std::env::var_os("CLOUDPHOTOS_HELPER").map(PathBuf::from).unwrap_or_else(default_script);
+    let python = std::env::var_os("CLOUDPHOTOS_PYTHON").map(PathBuf::from).unwrap_or_else(default_python);
     let mut cmd = Command::new(python);
     cmd.arg("-u").arg(script);
     if let Some(fake) = std::env::var_os("CLOUDPHOTOS_FAKE") {
         cmd.arg("--fake").arg(fake);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // Requests carry file paths: UTF-8 on the pipes, whatever the code page.
+        cmd.env("PYTHONUTF8", "1").creation_flags(CREATE_NO_WINDOW);
+        // The bundle's OpenSSL providers; MSYS2's build looks under C:\msys64.
+        if let Some(modules) = bundle_dir().map(|dir| dir.join("lib/ossl-modules")).filter(|dir| dir.exists()) {
+            cmd.env("OPENSSL_MODULES", modules);
+        }
+    }
     cmd
+}
+
+#[cfg(not(windows))]
+fn default_script() -> PathBuf {
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("helper/photos_helper.py");
+    if std::path::Path::new("/.flatpak-info").exists() || !dev.exists() {
+        PathBuf::from("/app/libexec/cloudphotos/photos_helper.py")
+    } else {
+        dev
+    }
+}
+
+#[cfg(not(windows))]
+fn default_python() -> PathBuf {
+    // Outside the Flatpak, pyicloud comes from icloud-linux's venv.
+    let venv = glib::home_dir().join(".local/share/icloud-linux/.venv/bin/python");
+    if !std::path::Path::new("/.flatpak-info").exists() && venv.exists() { venv } else { "python3".into() }
+}
+
+/// The Windows bundle: bin\cloudphotos.exe and bin\python.exe, the helper
+/// in libexec\cloudphotos.
+#[cfg(windows)]
+fn bundle_dir() -> Option<PathBuf> {
+    Some(std::env::current_exe().ok()?.parent()?.parent()?.to_owned())
+}
+
+#[cfg(windows)]
+fn default_script() -> PathBuf {
+    bundle_dir()
+        .map(|dir| dir.join("libexec/cloudphotos/photos_helper.py"))
+        .filter(|path| path.exists())
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("helper/photos_helper.py"))
+}
+
+#[cfg(windows)]
+fn default_python() -> PathBuf {
+    // The bundle's Python, else a development venv (windows/setup-dev.ps1).
+    let bundled = bundle_dir().map(|dir| dir.join("bin/python.exe")).filter(|path| path.exists());
+    let venv = glib::user_data_dir().join("cloudphotos/venv/bin/python.exe");
+    bundled.or_else(|| venv.exists().then_some(venv)).unwrap_or_else(|| "python".into())
 }
 
 impl Helper {

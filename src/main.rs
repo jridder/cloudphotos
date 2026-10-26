@@ -2,7 +2,10 @@
 //!
 //! The interface, library index, caching and downloads are Rust; talking to
 //! Apple goes through a small Python helper (helper/photos_helper.py) that
-//! reuses icloud-linux's sign-in.
+//! reuses icloud-linux's sign-in (on Windows, signs in itself).
+
+// Release builds on Windows are a GUI app: no console window behind it.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod asset_object;
 mod edit;
@@ -30,7 +33,7 @@ fn main() -> glib::ExitCode {
     // to download them through a GL context, and on NVIDIA that context can
     // fail to become current, which aborts the app (epoxy "Couldn't find
     // current GLX or EGL context"). The GL renderer draws them directly.
-    if std::env::var_os("GSK_RENDERER").is_none() {
+    if cfg!(not(windows)) && std::env::var_os("GSK_RENDERER").is_none() {
         // SAFETY: first thing in main, before GTK or any other thread starts.
         unsafe { std::env::set_var("GSK_RENDERER", "gl") };
     }
@@ -47,7 +50,8 @@ fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).flags(flags).build();
     app.connect_startup(|_| {
         let display = gdk::Display::default().expect("a display");
-        // Running from the source tree; the Flatpak installs these into hicolor.
+        // Running from the source tree; the Flatpak and the Windows bundle
+        // install these into hicolor.
         let icons = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/icons/hicolor/symbolic/apps");
         if icons.is_dir() {
             gtk::IconTheme::for_display(&display).add_search_path(icons);

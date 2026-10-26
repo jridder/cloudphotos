@@ -7,13 +7,21 @@ Talks JSON lines on stdin/stdout:
   <- {"id": 1, "result": {...}}            or {"id": 1, "error": {"code": ..., "message": ...}}
   <- {"event": "assets", "items": [...]}   (streamed while a scan runs)
 
-It never signs in with a password. It reuses the session icloud-linux saved
-(copied, so the two never write the same files); when that session has
-expired it answers "needs_signin" and the app sends you to the iCloud Drive
-app's Sign In Again.
+On Linux it never signs in with a password. It reuses the session
+icloud-linux saved (copied, so the two never write the same files); when
+that session has expired it answers "needs_signin" and the app sends you to
+the iCloud Drive app's Sign In Again.
+
+On Windows there's no icloud-linux, so the app keeps a session of its own
+(connect with `account`): `signin` hands the password to pyicloud once, and
+only the session cookies and the Apple ID are kept, never the password.
 
 Methods:
   connect  {config, cookie_dir, session_dir}   -> {apple_id}
+  connect  {account, session_dir}              -> {apple_id}  (own session; Windows)
+  signin   {username, password, account, session_dir}
+                                               -> {apple_id} or {needs_code: true}
+  verify   {code}                              -> {apple_id}  (the two-factor code after signin)
   scan     {}                                  -> {sync_token, recently_deleted: [{id, expires}]};
                                                   emits "assets" and "albums"
   changes  {since}                             -> {sync_token, assets, trashed: [{id, expires}], removed: [id],
@@ -188,13 +196,22 @@ def record_value(record, field):
 
 # ── iCloud ──────────────────────────────────────────────────────────────────
 
+def apple_id(api, username):
+    if getattr(api, "data", None) and "dsInfo" in api.data:
+        return api.data["dsInfo"].get("appleId", username)
+    return username
+
+
 class ICloudLibrary:
     def __init__(self):
         self.api = None
+        # A sign-in waiting for its two-factor code: (api, account path).
+        self.pending = None
 
     def connect(self, params):
+        if params.get("account"):
+            return self._connect_own(params)
         import yaml
-        from pyicloud import PyiCloudService
 
         config_path = os.path.expanduser(params.get("config") or "~/.config/icloud-linux/config.yaml")
         try:
@@ -212,6 +229,10 @@ class ICloudLibrary:
             shutil.rmtree(session_dir, ignore_errors=True)
             shutil.copytree(source, session_dir)
         os.makedirs(session_dir, exist_ok=True)
+        return self._resume(username, session_dir)
+
+    def _resume(self, username, session_dir):
+        from pyicloud import PyiCloudService
 
         # password=None: pyicloud can only reuse the saved session; it never
         # attempts a password sign-in on our behalf.
@@ -223,10 +244,55 @@ class ICloudLibrary:
         if api.requires_2fa or api.requires_2sa:
             raise HelperError("needs_signin", "iCloud needs you to sign in again.")
         self.api = api
-        apple_id = username
-        if getattr(api, "data", None) and "dsInfo" in api.data:
-            apple_id = api.data["dsInfo"].get("appleId", username)
-        return {"apple_id": apple_id}
+        return {"apple_id": apple_id(api, username)}
+
+    def _connect_own(self, params):
+        try:
+            with open(params["account"], encoding="utf-8") as handle:
+                username = json.load(handle).get("username")
+        except (OSError, ValueError):
+            username = None
+        if not username:
+            raise HelperError("not_configured", "Sign in with your Apple ID to see your iCloud Photos.")
+        return self._resume(username, params["session_dir"])
+
+    def signin(self, params):
+        from pyicloud import PyiCloudService
+
+        session_dir = params["session_dir"]
+        shutil.rmtree(session_dir, ignore_errors=True)
+        os.makedirs(session_dir, exist_ok=True)
+        self.pending = None
+        try:
+            api = PyiCloudService(params["username"], params["password"], cookie_directory=session_dir)
+        except Exception as exc:
+            if type(exc).__name__ == "PyiCloudFailedLoginException":
+                raise HelperError("bad_password", "Your Apple ID or password was incorrect.")
+            raise HelperError("failed", f"Couldn't sign in ({exc}).")
+        if api.requires_2sa and not api.requires_2fa:
+            raise HelperError("failed", "This Apple ID uses the older two-step verification, which Cloud Photos doesn't support.")
+        self.pending = (api, params["account"])
+        if api.requires_2fa:
+            return {"needs_code": True}
+        return self._signed_in()
+
+    def verify(self, params):
+        if self.pending is None:
+            raise HelperError("failed", "Sign in again; the code request has expired.")
+        api, _ = self.pending
+        if not api.validate_2fa_code(str(params.get("code", "")).strip()):
+            raise HelperError("bad_code", "That code didn't work. Check it and try again.")
+        if not api.is_trusted_session:
+            api.trust_session()
+        return self._signed_in()
+
+    def _signed_in(self):
+        api, account = self.pending
+        self.pending = None
+        with open(account, "w", encoding="utf-8") as handle:
+            json.dump({"username": api.account_name}, handle)
+        self.api = api
+        return {"apple_id": apple_id(api, api.account_name)}
 
     def _photos(self):
         if self.api is None:
@@ -456,8 +522,27 @@ class FakeLibrary:
 
     def connect(self, params):
         self._record("connect", params)
+        if params.get("account") and not os.path.exists(params["account"]):
+            raise HelperError("not_configured", "Sign in with your Apple ID to see your iCloud Photos.")
         if os.path.exists(os.path.join(self.directory, "needs_signin")):
             raise HelperError("needs_signin", "iCloud needs you to sign in again.")
+        return {"apple_id": "someone@example.com"}
+
+    def signin(self, params):
+        """Any password but "wrong" works; a code is always asked for."""
+        self._record("signin", {k: v for k, v in params.items() if k != "password"})
+        if params.get("password") == "wrong":
+            raise HelperError("bad_password", "Your Apple ID or password was incorrect.")
+        self.account = params["account"]
+        return {"needs_code": True}
+
+    def verify(self, params):
+        """The code is 123456."""
+        self._record("verify", params)
+        if params.get("code") != "123456":
+            raise HelperError("bad_code", "That code didn't work. Check it and try again.")
+        with open(self.account, "w", encoding="utf-8") as handle:
+            json.dump({"username": "someone@example.com"}, handle)
         return {"apple_id": "someone@example.com"}
 
     scans = 0
@@ -528,7 +613,7 @@ class FakeLibrary:
 def main():
     fake = sys.argv[sys.argv.index("--fake") + 1] if "--fake" in sys.argv else None
     library = FakeLibrary(fake) if fake else ICloudLibrary()
-    methods = {name: getattr(library, name) for name in ("connect", "scan", "changes", "urls", "favorite", "delete", "recover", "purge", "upload")}
+    methods = {name: getattr(library, name) for name in ("connect", "signin", "verify", "scan", "changes", "urls", "favorite", "delete", "recover", "purge", "upload")}
     for line in sys.stdin:
         try:
             request = json.loads(line)

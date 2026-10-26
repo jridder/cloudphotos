@@ -42,7 +42,7 @@ struct Viewer {
     actions: gio::SimpleActionGroup,
     /// The Live Photo clip already loaded for the current item, replayed on
     /// later clicks rather than fetched again.
-    live_media: RefCell<Option<(String, gtk::MediaFile)>>,
+    live_media: RefCell<Option<(String, gtk::MediaStream)>>,
     live_pending: Cell<bool>,
 }
 
@@ -264,6 +264,14 @@ pub fn open(nav: &adw::NavigationView, toasts: &adw::ToastOverlay, items: &gio::
     page.grab_focus();
 }
 
+/// GTK's own GStreamer playback, except on Windows (see ui::player).
+fn media_for(file: &gio::File) -> gtk::MediaStream {
+    #[cfg(windows)]
+    return crate::ui::player::Player::for_file(file).upcast();
+    #[cfg(not(windows))]
+    gtk::MediaFile::for_file(file).upcast()
+}
+
 fn nav_button(icon: &str, halign: gtk::Align) -> gtk::Button {
     let button = gtk::Button::builder()
         .icon_name(icon)
@@ -380,7 +388,7 @@ impl Viewer {
         if self.object.borrow().as_ref() != Some(object) {
             return;
         }
-        let media = gtk::MediaFile::for_file(&file);
+        let media = media_for(&file);
         if live {
             let stack = self.stack.clone();
             media.connect_ended_notify(move |m| {

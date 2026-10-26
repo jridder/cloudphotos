@@ -1,12 +1,13 @@
 //! Turning an edit recipe into pixels, from the full-resolution original.
 //!
 //! Decoding goes through glycin (GNOME's sandboxed image loaders, which
-//! handle HEIC, RAW, PNG… and apply EXIF orientation); the transform and
-//! JPEG encoding run on a worker thread.
+//! handle HEIC, RAW, PNG… and apply EXIF orientation); on Windows, where
+//! there's no glycin, through libheif and the image crate. The transform
+//! and JPEG encoding run on a worker thread.
 
 use std::path::{Path, PathBuf};
 
-use gtk::{gio, glib};
+use gtk::glib;
 use image::RgbaImage;
 use serde::{Deserialize, Serialize};
 
@@ -24,15 +25,66 @@ const THUMB_EDGE: u32 = 512;
 pub async fn decode_original(store: &Store, temp: &Path, id: &str) -> Result<(RgbaImage, Option<Vec<u8>>), String> {
     let source = temp.join(format!("edit-source-{}", glib::compute_checksum_for_string(glib::ChecksumType::Sha1, id).unwrap_or_default()));
     store.copy_out(id, ORIGINAL, source.clone()).await.map_err(|e| format!("The original isn't available ({e:?})"))?;
-    let result = async {
-        let mut image = glycin::Loader::new(gio::File::for_path(&source)).load().await.map_err(|e| format!("Couldn't open the original: {e}"))?;
-        let frame = image.next_frame().await.map_err(|e| format!("Couldn't decode the original: {e}"))?;
-        let icc = frame.details().color_icc_profile().map(|b| b.to_vec());
-        Ok((edit::texture_pixels(&frame.texture()), icc))
-    }
-    .await;
+    let result = decode_file(&source).await;
     let _ = std::fs::remove_file(&source);
     result
+}
+
+#[cfg(not(windows))]
+async fn decode_file(source: &Path) -> Result<(RgbaImage, Option<Vec<u8>>), String> {
+    let mut image = glycin::Loader::new(gtk::gio::File::for_path(source)).load().await.map_err(|e| format!("Couldn't open the original: {e}"))?;
+    let frame = image.next_frame().await.map_err(|e| format!("Couldn't decode the original: {e}"))?;
+    let icc = frame.details().color_icc_profile().map(|b| b.to_vec());
+    Ok((edit::texture_pixels(&frame.texture()), icc))
+}
+
+#[cfg(windows)]
+async fn decode_file(source: &Path) -> Result<(RgbaImage, Option<Vec<u8>>), String> {
+    let bytes = std::fs::read(source).map_err(|e| format!("Couldn't open the original: {e}"))?;
+    off_thread(move || {
+        // HEIC, HEIF and AVIF are ISO media files: an "ftyp" box comes first.
+        if bytes.get(4..8) == Some(b"ftyp".as_slice()) { decode_heif(&bytes) } else { decode_image(&bytes) }
+    })
+    .await
+}
+
+/// HEIC through libheif, which applies the file's rotation and mirroring.
+#[cfg(windows)]
+fn decode_heif(bytes: &[u8]) -> Result<(RgbaImage, Option<Vec<u8>>), String> {
+    use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
+
+    let context = HeifContext::read_from_bytes(bytes).map_err(|e| format!("Couldn't open the original: {e}"))?;
+    let handle = context.primary_image_handle().map_err(|e| format!("Couldn't open the original: {e}"))?;
+    let icc = handle.color_profile_raw().map(|profile| profile.data);
+    let image = LibHeif::new()
+        .decode(&handle, ColorSpace::Rgb(RgbChroma::Rgba), None)
+        .map_err(|e| format!("Couldn't decode the original: {e}"))?;
+    let plane = image.planes().interleaved.ok_or("Couldn't decode the original: no RGBA plane")?;
+    let (w, h) = (plane.width, plane.height);
+    let mut data = Vec::with_capacity((w * h * 4) as usize);
+    for row in plane.data.chunks(plane.stride).take(h as usize) {
+        data.extend_from_slice(&row[..(w * 4) as usize]);
+    }
+    let pixels = RgbaImage::from_raw(w, h, data).ok_or("Couldn't decode the original: bad image size")?;
+    Ok((pixels, icc))
+}
+
+/// JPEG, PNG and TIFF through the image crate, turned upright by the EXIF
+/// orientation.
+#[cfg(windows)]
+fn decode_image(bytes: &[u8]) -> Result<(RgbaImage, Option<Vec<u8>>), String> {
+    use image::ImageDecoder;
+
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("Couldn't open the original: {e}"))?
+        .into_decoder()
+        .map_err(|e| format!("Couldn't open the original: {e}"))?;
+    let icc = decoder.icc_profile().ok().flatten();
+    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut image = image::DynamicImage::from_decoder(decoder).map_err(|e| format!("Couldn't decode the original: {e}"))?;
+    image.apply_orientation(orientation);
+    Ok((image.into_rgba8(), icc))
 }
 
 /// Run `f` on a worker thread and await its result.

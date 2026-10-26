@@ -82,6 +82,13 @@ pub fn run(window: adw::ApplicationWindow) {
                         row.set_active(state == "on");
                     }
                 }
+                "type" => {
+                    // type TITLE TEXT: fill in the entry row TITLE (sign-in; TEXT has no spaces).
+                    let (title, text) = arg.rsplit_once(' ').unwrap_or((arg, ""));
+                    if let Some(row) = find_titled::<adw::EntryRow>(window.upcast_ref(), title) {
+                        row.set_text(text);
+                    }
+                }
                 "respond" => {
                     // respond ID: answer the open alert dialog (e.g. "respond delete").
                     if let Some(dialog) = find::<adw::AlertDialog>(window.upcast_ref()) {

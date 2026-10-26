@@ -20,12 +20,18 @@ use crate::{
     store::{self, Download, Store},
 };
 
+/// Whether the app signs in itself (Windows) rather than reusing
+/// icloud-linux's sign-in.
+pub const OWN_SIGNIN: bool = cfg!(windows);
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum State {
     Starting,
-    /// icloud-linux isn't set up on this computer.
+    /// icloud-linux isn't set up on this computer (with OWN_SIGNIN: never
+    /// signed in).
     NeedsSetup(String),
-    /// The shared session expired; sign in again in the iCloud Drive app.
+    /// The session expired; sign in again (in the iCloud Drive app, unless
+    /// OWN_SIGNIN).
     NeedsSignin(String),
     /// Offline or the helper failed; the local library still shows.
     Offline(String),
@@ -68,6 +74,8 @@ pub struct Model {
     checking: Cell<bool>,
     /// When iCloud was last asked (monotonic µs).
     last_check: Cell<i64>,
+    /// The periodic check is running (see `watch`).
+    watching: Cell<bool>,
     scan_assets: RefCell<Vec<Asset>>,
     scan_albums: RefCell<Vec<Album>>,
     listeners: RefCell<Vec<Rc<dyn Fn(&Event)>>>,
@@ -112,6 +120,7 @@ impl Model {
             syncing: Cell::new(false),
             checking: Cell::new(false),
             last_check: Cell::new(0),
+            watching: Cell::new(false),
             scan_assets: RefCell::default(),
             scan_albums: RefCell::default(),
             listeners: RefCell::default(),
@@ -180,10 +189,49 @@ impl Model {
             Err(e) => return self.set_state(State::Offline(e.message)),
         };
         self.helper.replace(Some(helper.clone()));
-        let params = json!({"session_dir": state_dir().join("session")});
+        let mut params = json!({"session_dir": state_dir().join("session")});
+        if OWN_SIGNIN {
+            params["account"] = json!(state_dir().join("account.json"));
+        }
         if let Err(e) = helper.call("connect", params).await {
             return self.set_state(state_for(e));
         }
+        self.connected().await;
+    }
+
+    /// Sign in with an Apple ID and password (OWN_SIGNIN). `Ok(true)` means
+    /// Apple sent a two-factor code: pass it to `verify`.
+    pub async fn sign_in(self: &Rc<Self>, username: &str, password: &str) -> Result<bool, String> {
+        let helper = self.helper.borrow().clone().ok_or("The iCloud helper isn't running.")?;
+        let params = json!({
+            "username": username,
+            "password": password,
+            "account": state_dir().join("account.json"),
+            "session_dir": state_dir().join("session"),
+        });
+        let value = helper.call("signin", params).await.map_err(|e| e.message)?;
+        if value.get("needs_code").and_then(Value::as_bool).unwrap_or(false) {
+            return Ok(true);
+        }
+        self.after_sign_in();
+        Ok(false)
+    }
+
+    /// The two-factor code after `sign_in`.
+    pub async fn verify(self: &Rc<Self>, code: &str) -> Result<(), String> {
+        let helper = self.helper.borrow().clone().ok_or("The iCloud helper isn't running.")?;
+        helper.call("verify", json!({"code": code})).await.map_err(|e| e.message)?;
+        self.after_sign_in();
+        Ok(())
+    }
+
+    fn after_sign_in(self: &Rc<Self>) {
+        let this = self.clone();
+        glib::spawn_future_local(async move { this.connected().await });
+    }
+
+    /// Bring the library up to date, then keep it so.
+    async fn connected(self: &Rc<Self>) {
         self.set_state(State::Ready);
         let outdated = self.library.borrow().meta("scan_version").as_deref() != Some(SCAN_VERSION);
         if outdated || self.all.n_items() == 0 {
@@ -203,6 +251,10 @@ impl Model {
     /// Keep up with changes made elsewhere (deleted on the iPhone, say) by
     /// asking iCloud every couple of minutes while the app is open.
     fn watch(self: &Rc<Self>) {
+        // Once: signing in again after a session expired comes back here.
+        if self.watching.replace(true) {
+            return;
+        }
         let seconds = std::env::var("CLOUDPHOTOS_POLL_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
         let weak = Rc::downgrade(self);
         glib::timeout_add_seconds_local(seconds, move || {

@@ -3,7 +3,8 @@
 //! JPEG thumbnail and preview used for display).
 //!
 //! Default location: ~/Pictures/iCloud Photos/Photos Library.sqlite
-//! (CLOUDPHOTOS_LIBRARY overrides it, for tests).
+//! (Pictures\Cloud Photos on Windows; CLOUDPHOTOS_LIBRARY overrides it, for
+//! tests).
 //!
 //! Blobs live in their own table so browsing never touches their pages, and
 //! go in and out through SQLite's incremental blob I/O so even multi-GB
@@ -136,7 +137,9 @@ pub fn default_path() -> PathBuf {
     std::env::var_os("CLOUDPHOTOS_LIBRARY").map(PathBuf::from).unwrap_or_else(|| {
         let pictures = gtk::glib::user_special_dir(gtk::glib::UserDirectory::Pictures)
             .unwrap_or_else(|| gtk::glib::home_dir().join("Pictures"));
-        pictures.join("iCloud Photos").join("Photos Library.sqlite")
+        // iCloud for Windows has used Pictures\iCloud Photos itself.
+        let folder = if cfg!(windows) { "Cloud Photos" } else { "iCloud Photos" };
+        pictures.join(folder).join("Photos Library.sqlite")
     })
 }
 
