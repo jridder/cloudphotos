@@ -19,6 +19,9 @@ const DECODERS: usize = 3;
 /// Two downloads at a time: plenty for a home connection, gentle on the account.
 pub const DOWNLOADERS: usize = 2;
 const MEMORY_LIMIT: usize = 400;
+/// Decoded textures kept, in bytes: previews (a zoomed-in grid shows them)
+/// are some 5 MB each, so the count alone could hold gigabytes.
+const MEMORY_BYTES: usize = 768 << 20;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
@@ -199,9 +202,15 @@ impl Store {
         if memory.insert(key.clone(), texture).is_none() {
             order.push_back(key);
         }
-        while order.len() > MEMORY_LIMIT {
-            if let Some(old) = order.pop_front() {
-                memory.remove(&old);
+        let size = |t: &gdk::Texture| {
+            use gdk::prelude::TextureExt;
+            t.width() as usize * t.height() as usize * 4
+        };
+        let mut bytes: usize = memory.values().map(size).sum();
+        while order.len() > MEMORY_LIMIT || (bytes > MEMORY_BYTES && order.len() > 1) {
+            let Some(old) = order.pop_front() else { break };
+            if let Some(texture) = memory.remove(&old) {
+                bytes -= size(&texture);
             }
         }
     }

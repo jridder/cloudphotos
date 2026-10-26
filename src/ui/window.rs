@@ -131,6 +131,7 @@ pub fn build(app: &adw::Application) -> Rc<Window> {
             },
         )
     };
+    header.pack_end(&grid.zoom_controls);
     let status = adw::StatusPage::new();
     // Signing in from the app (OWN_SIGNIN); shown when it's needed.
     let sign_in = gtk::Button::builder().label("Sign In…").halign(gtk::Align::Center).visible(false).build();
