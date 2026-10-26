@@ -48,8 +48,19 @@ VIAddVersionKey "LegalCopyright" "MIT License"
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
 
+; The app, and the D-Bus session (gdbus.exe) GLib starts for it, keep files
+; in use after the window closes; stop whatever runs from the install folder.
+; (Win32_Process, because the installer is 32-bit and Get-Process can't
+; read 64-bit processes' paths from there.)
+!macro StopRunning
+  nsExec::Exec `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process | Where-Object { $$_.ExecutablePath -like '$INSTDIR\*' } | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force }"`
+  Pop $0
+  Sleep 500
+!macroend
+
 Section "${APP_NAME}" SecApp
   SectionIn RO
+  !insertmacro StopRunning
   ; An update replaces the whole bundle, so no stale DLLs or plugins linger.
   RMDir /r "$INSTDIR\bin"
   RMDir /r "$INSTDIR\lib"
@@ -85,6 +96,7 @@ SectionEnd
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 Section "Uninstall"
+  !insertmacro StopRunning
   Delete "$SMPROGRAMS\${APP_NAME}.lnk"
   Delete "$DESKTOP\${APP_NAME}.lnk"
   RMDir /r "$INSTDIR\bin"
