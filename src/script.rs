@@ -11,6 +11,8 @@ pub fn run(window: adw::ApplicationWindow) {
         for step in steps {
             let (cmd, arg) = step.split_once(' ').unwrap_or((&step, ""));
             match cmd {
+                // import PATH[,PATH…]: as if chosen in Import (or dropped).
+                "import" => crate::model::model().import(arg.split(',').map(std::path::PathBuf::from).collect()),
                 "wait" => glib::timeout_future(std::time::Duration::from_secs_f64(arg.parse().unwrap_or(1.0))).await,
                 "shot" => shot(&window, arg),
                 "open" => {

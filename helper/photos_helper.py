@@ -32,6 +32,9 @@ Methods:
   recover  {id, master}                        -> {}   (back from Recently Deleted)
   purge    {id, master}                        -> {}   (removed from Recently Deleted for good)
   upload   {path}                              -> {asset}  (a new photo, e.g. an edited copy)
+  import   {path}                              -> {id, master, duplicate}  (a photo or video from
+                                                  this computer; the change feed brings it in once
+                                                  iCloud has indexed it)
 
 `--fake DIR` serves DIR/library.json instead, for tests and screenshots.
 """
@@ -502,6 +505,49 @@ class ICloudLibrary:
             raise HelperError("failed", "iCloud didn't accept the upload.")
         return {"asset": asset_dict(asset)}
 
+    def import_file(self, params):
+        """Add a photo or video to the library. Returns as soon as iCloud has
+        registered it, without waiting (up to a minute) for CloudKit to index
+        it; the app's next `changes` brings it in. A file the library already
+        holds comes back as a duplicate, not as a second copy."""
+        path = params["path"]
+        photos = self._photos()
+        library = photos._root_library
+        client = getattr(library, "_client", None)
+        try:
+            if client is None:
+                asset = photos.upload(path)
+                if asset is None:
+                    raise HelperError("failed", "iCloud didn't accept it.")
+                return {"id": asset.id, "master": asset.master_id, "duplicate": False}
+            result = client.upload_file(path, zone_name=str(library.zone_id.get("zoneName") or ""))
+        except HelperError:
+            raise
+        except Exception as exc:
+            if signin_failure(exc):
+                raise HelperError("needs_signin", "iCloud needs you to sign in again.")
+            raise HelperError("failed", upload_failure(exc))
+        return {"id": result.cplAsset, "master": result.cplMaster, "duplicate": bool(result.is_duplicate)}
+
+
+def signin_failure(exc):
+    """Apple no longer accepts the session (rather than this one file)."""
+    if type(exc).__name__ in ("PyiCloud2FARequiredException", "PyiCloud2SARequiredException",
+                              "PyiCloudAuthRequiredException", "PyiCloudFailedLoginException"):
+        return True
+    text = str(exc)
+    return "Authentication required" in text or "HTTP 401" in text or "HTTP 421" in text
+
+
+def upload_failure(exc):
+    """A short reason for a file iCloud wouldn't take."""
+    text = str(exc)
+    if "rejected" in text and "status" in text:
+        return "iCloud didn't accept this file (it may not be a photo or video format iCloud supports)."
+    if type(exc).__name__ in ("PyiCloudConnectionException", "ConnectionError", "Timeout"):
+        return "Couldn't reach iCloud."
+    return text or type(exc).__name__
+
 
 # ── fake library (tests) ────────────────────────────────────────────────────
 
@@ -596,6 +642,34 @@ class FakeLibrary:
         self._record("purge", params)
         return {}
 
+    def import_file(self, params):
+        """Adds the file to library.json (bumping its sync token, so the
+        next `changes` asks for a full scan); a name containing "dup" is a
+        duplicate, "bad" is refused."""
+        self._record("import", params)
+        path = params["path"]
+        name = os.path.basename(path)
+        if "bad" in name:
+            raise HelperError("failed", "iCloud didn't accept this file (it may not be a photo or video format iCloud supports).")
+        if "dup" in name:
+            return {"id": "DUP-" + name, "master": None, "duplicate": True}
+        library = self._library()
+        asset_id = f"IMPORT-{len(library['assets'])}-{name}"
+        res = {"url": "file://" + path, "size": os.path.getsize(path), "width": 1, "height": 1,
+               "type": "public.jpeg", "checksum": f"import-{asset_id}"}
+        video = name.lower().endswith((".mov", ".mp4", ".m4v"))
+        library["assets"].insert(0, {
+            "id": asset_id, "master": "M-" + asset_id, "filename": name, "kind": "video" if video else "photo",
+            "taken": time.time(), "added": time.time(), "width": 1, "height": 1, "size": res["size"],
+            "live": False, "favorite": False, "details": {},
+            "resources": {"thumb": dict(res), "preview": dict(res), "original": dict(res)},
+        })
+        library["sync_token"] = f"fake-import-{len(library['assets'])}"
+        library.pop("changes", None)
+        with open(os.path.join(self.directory, "library.json"), "w", encoding="utf-8") as handle:
+            json.dump(library, handle)
+        return {"id": asset_id, "master": "M-" + asset_id, "duplicate": False}
+
     def upload(self, params):
         self._record("upload", params)
         path = params["path"]
@@ -614,6 +688,7 @@ def main():
     fake = sys.argv[sys.argv.index("--fake") + 1] if "--fake" in sys.argv else None
     library = FakeLibrary(fake) if fake else ICloudLibrary()
     methods = {name: getattr(library, name) for name in ("connect", "signin", "verify", "scan", "changes", "urls", "favorite", "delete", "recover", "purge", "upload")}
+    methods["import"] = library.import_file
     for line in sys.stdin:
         try:
             request = json.loads(line)

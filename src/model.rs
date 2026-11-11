@@ -3,7 +3,8 @@
 
 use std::{
     cell::{Cell, OnceCell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    path::{Path, PathBuf},
     rc::Rc,
     time::Duration,
 };
@@ -48,8 +49,17 @@ pub enum Event {
     Edited(String),
     /// Downloading into the library: (files done, files total, bytes done), or idle.
     Syncing(Option<(usize, usize, u64)>),
+    /// Importing files into iCloud: (files done, files total), or idle.
+    Importing(Option<(usize, usize)>),
     Toast(String),
 }
+
+/// What Import looks for (in folders, too): the photo and video formats
+/// iCloud Photos takes. Anything else in a dropped folder is skipped.
+pub const IMPORT_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "heic", "heif", "png", "gif", "tif", "tiff", "webp", "avif", "dng", "cr2", "cr3", "nef",
+    "arw", "raf", "orf", "rw2", "mov", "mp4", "m4v", "3gp",
+];
 
 /// Items whose links are fetched in one request, then downloaded.
 const BATCH: usize = 100;
@@ -78,6 +88,10 @@ pub struct Model {
     watching: Cell<bool>,
     scan_assets: RefCell<Vec<Asset>>,
     scan_albums: RefCell<Vec<Album>>,
+    /// Files waiting to be imported, and how many this run has had in all.
+    import_queue: RefCell<VecDeque<PathBuf>>,
+    import_total: Cell<usize>,
+    importing: Cell<bool>,
     listeners: RefCell<Vec<Rc<dyn Fn(&Event)>>>,
 }
 
@@ -123,6 +137,9 @@ impl Model {
             watching: Cell::new(false),
             scan_assets: RefCell::default(),
             scan_albums: RefCell::default(),
+            import_queue: RefCell::default(),
+            import_total: Cell::new(0),
+            importing: Cell::new(false),
             listeners: RefCell::default(),
         })
     }
@@ -684,6 +701,95 @@ impl Model {
         Ok(())
     }
 
+    // ── importing ───────────────────────────────────────────────────────────
+
+    /// Upload photos and videos from this computer into iCloud Photos.
+    /// Folders are searched for them. Files added while an import runs join
+    /// it. They appear in the library once iCloud has taken them in.
+    pub fn import(self: &Rc<Self>, paths: Vec<PathBuf>) {
+        let files = media_files(paths);
+        if files.is_empty() {
+            self.notify(Event::Toast("Nothing to import: choose photos or videos.".into()));
+            return;
+        }
+        if self.state() != State::Ready || self.helper.borrow().is_none() {
+            self.notify(Event::Toast("Can't import: not connected to iCloud.".into()));
+            return;
+        }
+        self.import_total.set(self.import_total.get() + files.len());
+        self.import_queue.borrow_mut().extend(files);
+        if self.importing.replace(true) {
+            let done = self.import_total.get() - self.import_queue.borrow().len();
+            self.notify(Event::Importing(Some((done, self.import_total.get()))));
+            return;
+        }
+        let this = self.clone();
+        glib::spawn_future_local(async move { this.run_imports().await });
+    }
+
+    /// One file at a time, so other requests (links, favorites) get their
+    /// turn with the helper between files.
+    async fn run_imports(self: &Rc<Self>) {
+        let (mut done, mut added, mut duplicates) = (0usize, Vec::<String>::new(), 0usize);
+        let mut failed: Vec<(String, String)> = Vec::new();
+        let mut stopped: Option<String> = None;
+        loop {
+            let Some(path) = self.import_queue.borrow_mut().pop_front() else { break };
+            self.notify(Event::Importing(Some((done, self.import_total.get()))));
+            let Some(helper) = self.helper.borrow().clone() else {
+                stopped = Some("not connected to iCloud".into());
+                break;
+            };
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match helper.call("import", json!({"path": path})).await {
+                Ok(value) if value.get("duplicate").and_then(Value::as_bool).unwrap_or(false) => duplicates += 1,
+                Ok(value) => added.extend(value.get("id").and_then(Value::as_str).map(String::from)),
+                Err(e) if matches!(e.code.as_str(), "needs_signin" | "not_connected" | "helper_exited") => {
+                    stopped = Some(e.message.clone());
+                    if e.code != "helper_exited" {
+                        self.set_state(state_for(e));
+                    }
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("cloudphotos: import {name} failed: {}", e.message);
+                    failed.push((name, e.message));
+                }
+            }
+            done += 1;
+        }
+        let left = self.import_queue.borrow_mut().drain(..).count();
+        self.import_total.set(0);
+        self.importing.set(false);
+        self.notify(Event::Importing(None));
+        self.notify(Event::Toast(import_summary(added.len(), duplicates, &failed, left, stopped.as_deref())));
+        if !added.is_empty() {
+            self.bring_in(added).await;
+        }
+    }
+
+    /// Fetch newly imported items: iCloud takes a few seconds to index an
+    /// upload, so ask again a few times while some are still missing. (The
+    /// regular check picks up any that take longer.)
+    async fn bring_in(self: &Rc<Self>, ids: Vec<String>) {
+        for delay in [3, 10, 30] {
+            glib::timeout_future_seconds(delay).await;
+            if self.state() != State::Ready {
+                return;
+            }
+            // Another check may be under way; wait for it rather than skip.
+            while self.checking.get() || self.scanning.get() {
+                glib::timeout_future(Duration::from_millis(500)).await;
+            }
+            if self.catch_up().await {
+                self.sync().await;
+            }
+            if ids.iter().all(|id| self.by_id.borrow().contains_key(id)) {
+                return;
+            }
+        }
+    }
+
     // ── changes ─────────────────────────────────────────────────────────────
 
     pub async fn set_favorite(self: &Rc<Self>, object: &AssetObject, value: bool) {
@@ -809,10 +915,95 @@ pub fn replace_items(store: &gio::ListStore, objects: &[AssetObject]) {
     }
 }
 
+/// Files to import from what was chosen or dropped: folders searched
+/// (hidden files skipped), only photo and video formats, each file once.
+fn media_files(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    fn walk(path: &Path, out: &mut Vec<PathBuf>) {
+        if path.is_dir() {
+            let Ok(entries) = std::fs::read_dir(path) else { return };
+            let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            children.sort();
+            for child in children {
+                if !child.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
+                    walk(&child, out);
+                }
+            }
+        } else if is_media(path) {
+            out.push(path.to_owned());
+        }
+    }
+    let mut out = Vec::new();
+    for path in paths {
+        walk(&path, &mut out);
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(p.clone()));
+    out
+}
+
+pub fn is_media(path: &Path) -> bool {
+    path.extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .is_some_and(|e| IMPORT_EXTENSIONS.contains(&e.as_str()))
+}
+
+/// The toast after an import, e.g. "Imported 12 items · 2 were already in iCloud".
+fn import_summary(added: usize, duplicates: usize, failed: &[(String, String)], left: usize, stopped: Option<&str>) -> String {
+    let items = |n: usize| if n == 1 { "1 item".to_string() } else { format!("{n} items") };
+    let mut parts = Vec::new();
+    if added > 0 || (duplicates == 0 && failed.is_empty()) {
+        parts.push(format!("Imported {}", items(added)));
+    }
+    if duplicates > 0 {
+        parts.push(if duplicates == 1 { "1 was already in iCloud".into() } else { format!("{duplicates} were already in iCloud") });
+    }
+    match failed {
+        [] => {}
+        [(name, reason)] => parts.push(format!("{name} couldn't be imported: {reason}")),
+        _ => parts.push(format!("{} couldn't be imported", items(failed.len()))),
+    }
+    if let Some(reason) = stopped {
+        parts.push(format!("stopped with {} left: {reason}", items(left + 1)));
+    }
+    parts.join(" · ")
+}
+
 fn state_for(e: HelperError) -> State {
     match e.code.as_str() {
         "not_configured" => State::NeedsSetup(e.message),
         "needs_signin" => State::NeedsSignin(e.message),
         _ => State::Offline(e.message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_files_searches_folders_and_skips_the_rest() {
+        let dir = std::env::temp_dir().join(format!("cloudphotos-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("trip/.thumbs")).unwrap();
+        for name in ["a.JPG", "b.heic", "notes.txt", "trip/c.mov", "trip/.thumbs/d.jpg", "trip/.hidden.png"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let files = media_files(vec![dir.join("a.JPG"), dir.join("a.JPG"), dir.join("notes.txt"), dir.join("trip"), dir.join("b.heic")]);
+        let names: Vec<_> = files.iter().map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["a.JPG", "trip/c.mov", "b.heic"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn import_summary_reads_naturally() {
+        assert_eq!(import_summary(1, 0, &[], 0, None), "Imported 1 item");
+        assert_eq!(import_summary(12, 2, &[], 0, None), "Imported 12 items · 2 were already in iCloud");
+        assert_eq!(import_summary(0, 1, &[], 0, None), "1 was already in iCloud");
+        let one = [("x.png".to_string(), "Couldn't reach iCloud.".to_string())];
+        assert_eq!(import_summary(3, 0, &one, 0, None), "Imported 3 items · x.png couldn't be imported: Couldn't reach iCloud.");
+        assert_eq!(
+            import_summary(2, 0, &[], 4, Some("iCloud needs you to sign in again.")),
+            "Imported 2 items · stopped with 5 items left: iCloud needs you to sign in again."
+        );
     }
 }

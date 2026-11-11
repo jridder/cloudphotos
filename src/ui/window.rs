@@ -3,7 +3,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 use adw::prelude::*;
-use gtk::{gio, glib};
+use gtk::{gdk, gio, glib};
 
 use crate::{
     asset_object::AssetObject,
@@ -67,6 +67,10 @@ pub struct Window {
     title: adw::WindowTitle,
     spinner: adw::Spinner,
     refresh: gtk::Button,
+    import: gtk::Button,
+    import_box: gtk::Box,
+    import_label: gtk::Label,
+    import_bar: gtk::ProgressBar,
     sync_box: gtk::Box,
     sync_label: gtk::Label,
     sync_bar: gtk::ProgressBar,
@@ -104,6 +108,23 @@ pub fn build(app: &adw::Application) -> Rc<Window> {
         .build();
     sync_box.append(&sync_label);
     sync_box.append(&sync_bar);
+    // Import progress, above it.
+    let import_label = gtk::Label::builder().xalign(0.0).wrap(true).build();
+    import_label.add_css_class("caption");
+    import_label.add_css_class("dimmed");
+    let import_bar = gtk::ProgressBar::new();
+    let import_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(6)
+        .margin_bottom(6)
+        .visible(false)
+        .build();
+    import_box.append(&import_label);
+    import_box.append(&import_bar);
+    sidebar_view.add_bottom_bar(&import_box);
     sidebar_view.add_bottom_bar(&sync_box);
     let sidebar_page = adw::NavigationPage::builder().title("Cloud Photos").child(&sidebar_view).build();
 
@@ -111,7 +132,9 @@ pub fn build(app: &adw::Application) -> Rc<Window> {
     let title = adw::WindowTitle::new("Library", "");
     let spinner = adw::Spinner::builder().visible(false).build();
     let refresh = gtk::Button::builder().icon_name("view-refresh-symbolic").tooltip_text("Check for New Photos").build();
+    let import = gtk::Button::builder().icon_name("list-add-symbolic").tooltip_text("Import Photos and Videos… (Ctrl+I)").build();
     let header = adw::HeaderBar::builder().title_widget(&title).build();
+    header.pack_start(&import);
     header.pack_end(&refresh);
     header.pack_end(&spinner);
 
@@ -170,6 +193,10 @@ pub fn build(app: &adw::Application) -> Rc<Window> {
         title,
         spinner,
         refresh,
+        import,
+        import_box,
+        import_label,
+        import_bar,
         sync_box,
         sync_label,
         sync_bar,
@@ -187,6 +214,39 @@ pub fn build(app: &adw::Application) -> Rc<Window> {
         }
     });
     win.refresh.connect_clicked(|_| model().refresh());
+    let weak = Rc::downgrade(&win);
+    win.import.connect_clicked(move |_| {
+        if let Some(win) = weak.upgrade() {
+            win.choose_imports();
+        }
+    });
+    let weak = Rc::downgrade(&win);
+    let shortcuts = gtk::ShortcutController::new();
+    shortcuts.set_scope(gtk::ShortcutScope::Managed);
+    shortcuts.add_shortcut(gtk::Shortcut::new(
+        gtk::ShortcutTrigger::parse_string("<Control>i"),
+        Some(gtk::CallbackAction::new(move |_, _| {
+            if let Some(win) = weak.upgrade() {
+                if win.import.is_sensitive() {
+                    win.choose_imports();
+                }
+            }
+            glib::Propagation::Stop
+        })),
+    ));
+    win.window.add_controller(shortcuts);
+    // Dropping files or folders anywhere in the window imports them.
+    let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
+    drop.connect_drop(|_, value, _, _| {
+        let Ok(files) = value.get::<gdk::FileList>() else { return false };
+        let paths: Vec<_> = files.files().iter().filter_map(|f| f.path()).collect();
+        if paths.is_empty() || model().state() != State::Ready {
+            return false;
+        }
+        model().import(paths);
+        true
+    });
+    win.toasts.add_controller(drop);
     let weak = Rc::downgrade(&win);
     sign_in.connect_clicked(move |_| {
         if let Some(win) = weak.upgrade() {
@@ -209,6 +269,7 @@ pub fn build(app: &adw::Application) -> Rc<Window> {
             Event::Scanning(count) => win.update_scanning(*count),
             Event::Albums => win.rebuild_sidebar(),
             Event::Syncing(progress) => win.update_sync(*progress),
+            Event::Importing(progress) => win.update_import(*progress),
             Event::Toast(message) => win.toast(message),
             Event::Edited(_) => {}
         }
@@ -320,6 +381,7 @@ impl Window {
         let state = model().state();
         let empty = self.items.borrow().as_ref().is_none_or(|i| i.n_items() == 0);
         self.refresh.set_sensitive(state == State::Ready && !model().is_scanning());
+        self.import.set_sensitive(state == State::Ready);
         let page = match (&state, empty) {
             (State::NeedsSetup(message), _) if OWN_SIGNIN => Some(("Sign In to iCloud", "dialog-password-symbolic", message.clone())),
             (State::NeedsSetup(message), _) => Some(("Set Up iCloud Drive First", "dialog-information-symbolic", message.clone())),
@@ -390,6 +452,40 @@ impl Window {
 }
 
 impl Window {
+    /// The file chooser for Import: photos and videos, several at once.
+    fn choose_imports(&self) {
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Photos and Videos"));
+        filter.add_mime_type("image/*");
+        filter.add_mime_type("video/*");
+        for ext in crate::model::IMPORT_EXTENSIONS {
+            filter.add_suffix(ext);
+        }
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        let dialog = gtk::FileDialog::builder()
+            .title("Import to iCloud Photos")
+            .accept_label("Import")
+            .filters(&filters)
+            .default_filter(&filter)
+            .build();
+        dialog.open_multiple(Some(&self.window), gio::Cancellable::NONE, |result| {
+            let Ok(files) = result else { return };
+            let paths: Vec<_> = files.iter::<gio::File>().flatten().filter_map(|f| f.path()).collect();
+            if !paths.is_empty() {
+                model().import(paths);
+            }
+        });
+    }
+
+    fn update_import(&self, progress: Option<(usize, usize)>) {
+        self.import_box.set_visible(progress.is_some());
+        if let Some((done, total)) = progress {
+            self.import_label.set_label(&format!("Importing to iCloud · {} of {total}", (done + 1).min(total)));
+            self.import_bar.set_fraction(done as f64 / total.max(1) as f64);
+        }
+    }
+
     /// The sidebar footer: download progress, or what's still missing. Once
     /// everything is downloaded there's nothing to say, so it hides.
     fn update_sync(&self, progress: Option<(usize, usize, u64)>) {
