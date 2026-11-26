@@ -1,0 +1,8 @@
+.gradle/
+build/
+local.properties
+/app/build/
+/wheels/src/
+/wheels/target/
+/wheels/dist/
+*.apk

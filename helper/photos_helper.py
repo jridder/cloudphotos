@@ -37,6 +37,9 @@ Methods:
                                                   iCloud has indexed it)
 
 `--fake DIR` serves DIR/library.json instead, for tests and screenshots.
+
+The Android app (android/) runs this module in-process through Chaquopy:
+android_bridge.py calls handle() and forwards emit()'s events.
 """
 import json
 import os
@@ -109,7 +112,7 @@ def is_favorite(asset):
 
 def asset_details(asset):
     """What Apple's records say beyond the basics: caption, keywords,
-    location, time zone, video length, HDR/burst. Best effort: a field that
+    location, time zone, video length (duration, in 1/600 s), HDR/burst. Best effort: a field that
     can't be decoded is simply left out."""
     from pyicloud.services.photos_cloudkit.mappers import record_field_value
 
@@ -684,26 +687,37 @@ class FakeLibrary:
         }}
 
 
+def method_table(library):
+    methods = {name: getattr(library, name) for name in ("connect", "signin", "verify", "scan", "changes", "urls", "favorite", "delete", "recover", "purge", "upload")}
+    methods["import"] = library.import_file
+    return methods
+
+
+def handle(methods, request):
+    """One request -> its reply ({id, result} or {id, error}). The desktop
+    app sends these over stdin; the Android app calls this directly."""
+    request_id = request.get("id")
+    method = methods.get(request.get("method"))
+    try:
+        if method is None:
+            raise HelperError("bad_method", f"Unknown method {request.get('method')!r}")
+        return {"id": request_id, "result": method(request.get("params") or {})}
+    except HelperError as exc:
+        return {"id": request_id, "error": {"code": exc.code, "message": str(exc)}}
+    except Exception as exc:
+        return {"id": request_id, "error": {"code": "failed", "message": f"{type(exc).__name__}: {exc}"}}
+
+
 def main():
     fake = sys.argv[sys.argv.index("--fake") + 1] if "--fake" in sys.argv else None
     library = FakeLibrary(fake) if fake else ICloudLibrary()
-    methods = {name: getattr(library, name) for name in ("connect", "signin", "verify", "scan", "changes", "urls", "favorite", "delete", "recover", "purge", "upload")}
-    methods["import"] = library.import_file
+    methods = method_table(library)
     for line in sys.stdin:
         try:
             request = json.loads(line)
         except ValueError:
             continue
-        request_id = request.get("id")
-        method = methods.get(request.get("method"))
-        try:
-            if method is None:
-                raise HelperError("bad_method", f"Unknown method {request.get('method')!r}")
-            emit({"id": request_id, "result": method(request.get("params") or {})})
-        except HelperError as exc:
-            emit({"id": request_id, "error": {"code": exc.code, "message": str(exc)}})
-        except Exception as exc:
-            emit({"id": request_id, "error": {"code": "failed", "message": f"{type(exc).__name__}: {exc}"}})
+        emit(handle(methods, request))
 
 
 if __name__ == "__main__":

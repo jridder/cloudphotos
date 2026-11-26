@@ -88,8 +88,9 @@ pub fn fill(container: &gtk::Box, object: &AssetObject, still_current: Rc<dyn Fn
     what.add(&row("Dimensions", &dims));
     let format = asset.resources.get(ORIGINAL).and_then(|r| r.kind.as_deref()).map(file_format).unwrap_or("");
     what.add(&row("Original", &format!("{format} · {}", glib::format_size(asset.size)).trim_start_matches(" · ").to_string()));
-    if let Some(seconds) = details.get("duration").and_then(Value::as_f64).filter(|d| *d > 0.0) {
-        what.add(&row("Length", &format_duration(seconds)));
+    // Apple keeps the length in QuickTime's 1/600 s units.
+    if let Some(ticks) = details.get("duration").and_then(Value::as_f64).filter(|d| *d > 0.0) {
+        what.add(&row("Length", &format_duration(ticks / 600.0)));
     }
     if let Some(live) = asset.resources.get(LIVE) {
         let size = live.size.map(glib::format_size).map(|s| s.to_string()).unwrap_or_default();
