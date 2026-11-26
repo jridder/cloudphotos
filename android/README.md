@@ -11,10 +11,17 @@ What it does so far:
 
 - signs in with an Apple ID and the two-factor code
 - shows the library newest first, grouped by month, with video lengths and favorites
+- shows albums: the smart ones (Favorites, Screenshots, Videos, Live…) and your own
 - opens photos full screen and swipes between them
+- plays videos, and the motion part of Live Photos
 - remembers the library, so later launches only ask iCloud what changed
 
-It has no video playback, albums, editing, import or export yet.
+Videos and Live Photos stream Apple's smaller H.264 copy (`resVidMed`,
+which the helper's `urls` returns with `stream`), not the original. Any
+phone can decode that copy, and it uses less data. An iPhone original can
+be 10-bit Dolby Vision HEVC, which some decoders can't play.
+
+It has no editing, import, export, favoriting or deleting yet.
 
 ## Building
 
@@ -59,7 +66,9 @@ adb shell run-as com.jridder.cloudphotos cp -r /data/local/tmp/fake files/fake
 ```
 
 In the fake library, any password works except `wrong`, and the code is
-`123456`. Delete `files/fake` to go back to iCloud.
+`123456`. The generator's `clip.mov` is random bytes. To test playback,
+replace it with a real clip, for example from
+`ffmpeg -f lavfi -i testsrc2=size=1280x720 -t 4 -c:v libx264 -pix_fmt yuv420p clip.mov`. Delete `files/fake` to go back to iCloud.
 
 To load pyicloud and everything it needs on a device without signing in,
 run this and check logcat for `selftest OK`:

@@ -64,6 +64,26 @@ data class Asset(
     }
 }
 
+/** An album as the helper describes it: smart (Favorites, Videos…) or the user's own. */
+data class Album(val id: String, val name: String, val smart: Boolean, val assetIds: List<String>) {
+    fun toJson(): JSONObject = JSONObject()
+        .put("id", id)
+        .put("name", name)
+        .put("kind", if (smart) "smart" else "user")
+        .put("assets", JSONArray(assetIds))
+
+    companion object {
+        fun parse(o: JSONObject): Album? {
+            val id = o.optString("id").ifEmpty { return null }
+            val ids = o.optJSONArray("assets") ?: JSONArray()
+            return Album(id, o.optString("name", id), o.optString("kind") == "smart", (0 until ids.length()).map(ids::getString))
+        }
+
+        fun parseAll(array: JSONArray?): List<Album> =
+            if (array == null) emptyList() else (0 until array.length()).mapNotNull { parse(array.getJSONObject(it)) }
+    }
+}
+
 /** Newest first, as Photos shows them. */
 fun List<Asset>.newestFirst(): List<Asset> = sortedByDescending { it.taken }
 
@@ -74,7 +94,7 @@ fun List<Asset>.newestFirst(): List<Asset> = sortedByDescending { it.taken }
 class LibraryStore(dir: File) {
     private val file = File(dir, "library.json")
 
-    data class Saved(val syncToken: String?, val appleId: String?, val assets: List<Asset>)
+    data class Saved(val syncToken: String?, val appleId: String?, val assets: List<Asset>, val albums: List<Album>)
 
     fun load(): Saved? = try {
         val o = JSONObject(file.readText())
@@ -83,16 +103,18 @@ class LibraryStore(dir: File) {
             o.optString("sync_token").ifEmpty { null },
             o.optString("apple_id").ifEmpty { null },
             (0 until items.length()).mapNotNull { Asset.parse(items.getJSONObject(it)) },
+            Album.parseAll(o.optJSONArray("albums")),
         )
     } catch (e: Exception) {
         null
     }
 
-    fun save(syncToken: String?, appleId: String?, assets: List<Asset>) {
+    fun save(syncToken: String?, appleId: String?, assets: List<Asset>, albums: List<Album>) {
         val o = JSONObject()
         o.put("sync_token", syncToken ?: "")
         o.put("apple_id", appleId ?: "")
         o.put("assets", JSONArray().apply { assets.forEach { put(it.json) } })
+        o.put("albums", JSONArray().apply { albums.forEach { put(it.toJson()) } })
         val tmp = File(file.path + ".tmp")
         tmp.writeText(o.toString())
         tmp.renameTo(file)

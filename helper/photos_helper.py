@@ -26,7 +26,9 @@ Methods:
                                                   emits "assets" and "albums"
   changes  {since}                             -> {sync_token, assets, trashed: [{id, expires}], removed: [id],
                                                   albums_changed} since the token, or {full_scan: true}
-  urls     {ids: [...], masters: {id: master}} -> {id: {key: url}} with fresh download URLs
+  urls     {ids: [...], masters: {id: master}, stream?}
+                                               -> {id: {key: url}} with fresh download URLs (and,
+                                                  with stream, "stream"/"stream_live" to play)
   favorite {id, master, value}                 -> {}
   delete   {id, master}                        -> {}   (moves to Recently Deleted)
   recover  {id, master}                        -> {}   (back from Recently Deleted)
@@ -102,6 +104,19 @@ def asset_resources(asset):
         if res is not None:
             out[name] = resource_dict(res)
     return out
+
+
+def stream_urls(asset):
+    """Apple's smaller H.264 copies, for playing without downloading:
+    "stream" for a video (resVidMed) and "stream_live" for a Live Photo's
+    motion. Kept out of asset_resources, since the desktop library
+    downloads every resource listed there."""
+    r = asset.resources
+    if asset.item_type == "movie":
+        res = pick(r, "medium", "thumb")
+        return {"stream": res.url} if res is not None else {}
+    res = pick(r, "medium_video", "thumb_video")
+    return {"stream_live": res.url} if res is not None else {}
 
 
 def is_favorite(asset):
@@ -454,9 +469,15 @@ class ICloudLibrary:
         return out
 
     def urls(self, params):
-        """Fresh download URLs for several items in one CloudKit request."""
+        """Fresh download URLs for several items in one CloudKit request;
+        with `stream`, also the streaming copies (stream_urls)."""
         assets = self._lookup(params.get("ids", []), params.get("masters"))
-        return {i: {k: v["url"] for k, v in asset_resources(asset).items()} for i, asset in assets.items()}
+        out = {}
+        for i, asset in assets.items():
+            out[i] = {k: v["url"] for k, v in asset_resources(asset).items()}
+            if params.get("stream"):
+                out[i].update(stream_urls(asset))
+        return out
 
     def favorite(self, params):
         if not self._asset(params["id"], params.get("master")).set_favorite(bool(params["value"])):
@@ -627,7 +648,14 @@ class FakeLibrary:
     def urls(self, params):
         self._record("urls", params)
         by_id = {a["id"]: a for a in self._library()["assets"]}
-        return {i: {k: v["url"] for k, v in by_id[i]["resources"].items()} for i in params.get("ids", []) if i in by_id}
+        out = {i: {k: v["url"] for k, v in by_id[i]["resources"].items()} for i in params.get("ids", []) if i in by_id}
+        if params.get("stream"):
+            for urls in out.values():
+                if "live" in urls:
+                    urls["stream_live"] = urls["live"]
+                elif urls.get("original", "").endswith(".mov"):
+                    urls["stream"] = urls["original"]
+        return out
 
     def favorite(self, params):
         self._record("favorite", params)

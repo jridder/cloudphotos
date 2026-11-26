@@ -37,6 +37,9 @@ class LibraryViewModel(app: Application) : AndroidViewModel(app) {
     private val _assets = MutableStateFlow<List<Asset>>(emptyList())
     val assets: StateFlow<List<Asset>> = _assets
 
+    private val _albums = MutableStateFlow<List<Album>>(emptyList())
+    val albums: StateFlow<List<Album>> = _albums
+
     /** What's happening in the background ("Loading your library…"), or null. */
     private val _status = MutableStateFlow<String?>(null)
     val status: StateFlow<String?> = _status
@@ -46,6 +49,10 @@ class LibraryViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _messages = Channel<String>(Channel.BUFFERED)
     val messages = _messages.receiveAsFlow()
+
+    fun message(text: String) {
+        _messages.trySend(text)
+    }
 
     private var syncToken: String? = null
     private var connected = false
@@ -61,6 +68,7 @@ class LibraryViewModel(app: Application) : AndroidViewModel(app) {
             syncToken = saved.syncToken
             _appleId.value = saved.appleId
             _assets.value = saved.assets.newestFirst()
+            _albums.value = saved.albums
             _screen.value = Screen.Library
         }
         if (!account.exists()) {
@@ -111,7 +119,15 @@ class LibraryViewModel(app: Application) : AndroidViewModel(app) {
                     scan()
                 } else {
                     val changes = helper.call("changes", params("since" to token))
-                    if (changes.optBoolean("full_scan")) scan() else apply(changes)
+                    when {
+                        changes.optBoolean("full_scan") -> scan()
+                        // Album lists only come with a full scan, as on the desktop.
+                        changes.optBoolean("albums_changed") -> {
+                            apply(changes)
+                            scan()
+                        }
+                        else -> apply(changes)
+                    }
                 }
             } catch (e: HelperException) {
                 failed(e)
@@ -123,10 +139,15 @@ class LibraryViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun scan() {
         val found = ArrayList<Asset>()
+        var albums: List<Album>? = null
         val showAsTheyCome = _assets.value.isEmpty()
         var lastShown = 0L
         _status.value = "Loading your library…"
         val result = helper.call("scan") { event ->
+            if (event.optString("event") == "albums") {
+                albums = Album.parseAll(event.optJSONArray("albums"))
+                return@call
+            }
             if (event.optString("event") != "assets") return@call
             val items = event.optJSONArray("items") ?: return@call
             synchronized(found) {
@@ -143,6 +164,7 @@ class LibraryViewModel(app: Application) : AndroidViewModel(app) {
         val assets = synchronized(found) { found.filter { it.id !in deleted }.newestFirst() }
         syncToken = result.optString("sync_token").ifEmpty { null }
         _assets.value = assets
+        albums?.let { _albums.value = it }
         save()
     }
 
@@ -163,24 +185,42 @@ class LibraryViewModel(app: Application) : AndroidViewModel(app) {
         val token = syncToken
         val appleId = _appleId.value
         val assets = _assets.value
-        withContext(Dispatchers.IO) { store.save(token, appleId, assets) }
+        val albums = _albums.value
+        withContext(Dispatchers.IO) { store.save(token, appleId, assets, albums) }
     }
 
     /** Fresh download links for [asset]; also kept in the library. */
-    private suspend fun renewLinks(asset: Asset): Asset? = try {
-        val result = helper.call(
-            "urls",
-            JSONObject().put("ids", JSONArray().put(asset.id)).put("masters", JSONObject().put(asset.id, asset.master)),
-        )
-        result.optJSONObject(asset.id)?.let { urls ->
-            val fresh = asset.withUrls(urls)
-            withContext(Dispatchers.Main) {
-                _assets.value = _assets.value.map { if (it.id == asset.id) fresh else it }
-            }
-            fresh
+    private suspend fun renewLinks(asset: Asset): Asset? = freshUrls(asset, stream = false)?.let { urls ->
+        val fresh = asset.withUrls(urls)
+        withContext(Dispatchers.Main) {
+            _assets.value = _assets.value.map { if (it.id == asset.id) fresh else it }
         }
+        fresh
+    }
+
+    private suspend fun freshUrls(asset: Asset, stream: Boolean): JSONObject? = try {
+        helper.call(
+            "urls",
+            JSONObject()
+                .put("ids", JSONArray().put(asset.id))
+                .put("masters", JSONObject().put(asset.id, asset.master))
+                .put("stream", stream),
+        ).optJSONObject(asset.id)
     } catch (e: HelperException) {
         null
+    }
+
+    /**
+     * A fresh link for playing [asset]: [key] "original" for a video,
+     * "live" for a Live Photo's motion. Apple's smaller H.264 copy when
+     * there is one (any phone decodes it, and it's lighter on data; an
+     * iPhone original can be 10-bit Dolby Vision HEVC), else the file
+     * itself. Saved links expire within minutes, so it's always fresh.
+     */
+    suspend fun link(asset: Asset, key: String): String? {
+        val urls = freshUrls(asset, stream = true) ?: return asset.resources[key]?.url
+        val stream = urls.optString(if (key == "live") "stream_live" else "stream").ifEmpty { null }
+        return stream ?: urls.optString(key).ifEmpty { null } ?: asset.resources[key]?.url
     }
 
     private suspend fun failed(e: HelperException) {
@@ -236,6 +276,7 @@ class LibraryViewModel(app: Application) : AndroidViewModel(app) {
         if (appleId != _appleId.value) {
             syncToken = null
             _assets.value = emptyList()
+            _albums.value = emptyList()
             withContext(Dispatchers.IO) { store.clear() }
         }
         _appleId.value = appleId
@@ -250,6 +291,7 @@ class LibraryViewModel(app: Application) : AndroidViewModel(app) {
             connected = false
             syncToken = null
             _assets.value = emptyList()
+            _albums.value = emptyList()
             _appleId.value = null
             withContext(Dispatchers.IO) {
                 account.delete()
